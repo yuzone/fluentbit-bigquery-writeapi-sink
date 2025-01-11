@@ -115,7 +115,7 @@ func TestFLBPluginInit(t *testing.T) {
 	mockClient := &MockManagedWriterClient{
 		NewManagedStreamFunc: func(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error) {
 			currChecks.calledNewManagedStream++
-			if len(opts) == 7 {
+			if len(opts) == 8 {
 				currChecks.numInputs = true
 			}
 			return nil, nil
@@ -206,7 +206,7 @@ func TestFLBPluginInitExactlyOnce(t *testing.T) {
 	mockClient := &MockManagedWriterClient{
 		NewManagedStreamFunc: func(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error) {
 			currChecks.calledNewManagedStream++
-			if len(opts) == 7 {
+			if len(opts) == 8 {
 				currChecks.numInputs = true
 			}
 			return nil, nil

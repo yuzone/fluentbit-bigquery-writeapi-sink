@@ -285,6 +285,7 @@ func buildStream(ctx context.Context, config **outputConfig, streamIndex int) er
 		managedwriter.EnableWriteRetries((*config).enableRetry),
 		managedwriter.WithMaxInflightBytes((*config).maxQueueBytes),
 		managedwriter.WithMaxInflightRequests((*config).maxQueueRequests),
+		managedwriter.WithDefaultMissingValueInterpretation(storagepb.AppendRowsRequest_DEFAULT_VALUE),
 		managedwriter.WithTraceID("FluentBit"),
 	)
 
