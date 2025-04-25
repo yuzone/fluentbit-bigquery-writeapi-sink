@@ -13,7 +13,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	google.golang.org/api v0.223.0
 	google.golang.org/grpc v1.72.0
-	google.golang.org/protobuf v1.36.5
+	google.golang.org/protobuf v1.36.6
 )
 
 require (
