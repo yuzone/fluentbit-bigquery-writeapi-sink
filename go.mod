@@ -12,7 +12,7 @@ require (
 	github.com/googleapis/gax-go/v2 v2.14.2
 	github.com/stretchr/testify v1.10.0
 	google.golang.org/api v0.236.0
-	google.golang.org/grpc v1.72.2
+	google.golang.org/grpc v1.73.0
 	google.golang.org/protobuf v1.36.6
 )
 
