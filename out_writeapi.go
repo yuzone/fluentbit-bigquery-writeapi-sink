@@ -513,7 +513,10 @@ var getWriter = func(client ManagedWriterClient, ctx context.Context, projectID 
 // This function acts as a wrapper for the GetContext function so that we may override it to
 // Mock it whenever needed
 var getFLBPluginContext = func(ctx unsafe.Pointer) int {
-	return output.FLBPluginGetContext(ctx).(int)
+	if ctx != nil {
+		return *(*int)(ctx)
+	}
+	return 0
 }
 
 // Finalizes and Closes all streams in slice for a given instance

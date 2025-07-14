@@ -425,7 +425,10 @@ func TestFLBPluginFlushCtx(t *testing.T) {
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		return setID
+		if ctx != nil {
+			return *(*int)(ctx)
+		}
+		return 0
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
@@ -469,8 +472,8 @@ func TestFLBPluginFlushCtx(t *testing.T) {
 	defer patchRecord.Reset()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
-	uintptrValue := uintptr(setID)
-	pointerValue := unsafe.Pointer(uintptrValue)
+	// Use the address of setID instead of its value
+	pointerValue := unsafe.Pointer(&setID)
 
 	// Calls FlushCtx with this ID
 	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
@@ -675,8 +678,8 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 	defer patchBuild.Reset()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
-	uintptrValue := uintptr(setID)
-	pointerValue := unsafe.Pointer(uintptrValue)
+	// Use the address of setID instead of its value
+	pointerValue := unsafe.Pointer(&setID)
 
 	// Calls FlushCtx with this ID
 	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
@@ -790,7 +793,10 @@ func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		return setID
+		if ctx != nil {
+			return *(*int)(ctx)
+		}
+		return 0
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
@@ -834,8 +840,8 @@ func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 	defer patchRecord.Reset()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
-	uintptrValue := uintptr(setID)
-	pointerValue := unsafe.Pointer(uintptrValue)
+	// Use the address of setID instead of its value
+	pointerValue := unsafe.Pointer(&setID)
 
 	// Calls FlushCtx with this ID
 	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
@@ -960,7 +966,10 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		return setID
+		if ctx != nil {
+			return *(*int)(ctx)
+		}
+		return 0
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
@@ -1012,8 +1021,8 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	defer patchRecord.Reset()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
-	uintptrValue := uintptr(setID)
-	pointerValue := unsafe.Pointer(uintptrValue)
+	// Use the address of setID instead of its value
+	pointerValue := unsafe.Pointer(&setID)
 
 	// Calls FlushCtx with this ID
 	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
