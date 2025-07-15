@@ -2,7 +2,7 @@ module fluent-bit_writeapi_plugin
 
 go 1.23.0
 
-toolchain go1.24.4
+toolchain go1.24.5
 
 require (
 	bou.ke/monkey v1.0.2
