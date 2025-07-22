@@ -6,7 +6,7 @@ toolchain go1.24.5
 
 require (
 	bou.ke/monkey v1.0.2
-	cloud.google.com/go v0.121.3
+	cloud.google.com/go v0.121.4
 	cloud.google.com/go/bigquery v1.69.0
 	github.com/fluent/fluent-bit-go v0.0.0-20230731091245-a7a013e2473c
 	github.com/googleapis/gax-go/v2 v2.15.0
