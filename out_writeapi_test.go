@@ -20,7 +20,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"bou.ke/monkey"
+	"github.com/agiledragon/gomonkey/v2"
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
@@ -52,9 +52,9 @@ func (m *MockFLBPlugin) mockOutputRegister(def unsafe.Pointer, currname string, 
 func TestFLBPluginRegister(t *testing.T) {
 	currplugin := &MockFLBPlugin{}
 
-	patch := monkey.Patch(output.FLBPluginRegister, currplugin.mockOutputRegister)
+	patch := gomonkey.ApplyFunc(output.FLBPluginRegister, currplugin.mockOutputRegister)
 
-	defer patch.Unpatch()
+	defer patch.Reset()
 
 	result := FLBPluginRegister(nil)
 
@@ -142,7 +142,7 @@ func TestFLBPluginInit(t *testing.T) {
 	}
 	defer func() { getClient = originalFunc }()
 
-	patch1 := monkey.Patch(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+	patch1 := gomonkey.ApplyFunc(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
 		switch key {
 		case "ProjectID":
 			currChecks.configProjectID = true
@@ -169,12 +169,12 @@ func TestFLBPluginInit(t *testing.T) {
 			return ""
 		}
 	})
-	defer patch1.Unpatch()
+	defer patch1.Reset()
 
-	patch2 := monkey.Patch(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+	patch2 := gomonkey.ApplyFunc(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
 		currChecks.calledSetContext++
 	})
-	defer patch2.Unpatch()
+	defer patch2.Reset()
 
 	plugin := unsafe.Pointer(nil)
 	initsize := getInstanceCount()
@@ -233,7 +233,7 @@ func TestFLBPluginInitExactlyOnce(t *testing.T) {
 	}
 	defer func() { getClient = originalFunc }()
 
-	patch1 := monkey.Patch(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+	patch1 := gomonkey.ApplyFunc(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
 		switch key {
 		case "ProjectID":
 			currChecks.configProjectID = true
@@ -260,12 +260,12 @@ func TestFLBPluginInitExactlyOnce(t *testing.T) {
 			return ""
 		}
 	})
-	defer patch1.Unpatch()
+	defer patch1.Reset()
 
-	patch2 := monkey.Patch(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+	patch2 := gomonkey.ApplyFunc(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
 		currChecks.calledSetContext++
 	})
-	defer patch2.Unpatch()
+	defer patch2.Reset()
 
 	plugin := unsafe.Pointer(nil)
 	initsize := getInstanceCount()
@@ -410,22 +410,25 @@ func TestFLBPluginFlushCtx(t *testing.T) {
 	}
 	defer func() { getWriter = origFunc }()
 
-	patch1 := monkey.Patch(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+	patch1 := gomonkey.ApplyFunc(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
 		return ""
 	})
-	defer patch1.Unpatch()
+	defer patch1.Reset()
 
-	patchSetContext := monkey.Patch(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+	patchSetContext := gomonkey.ApplyFunc(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
 		setID = ctx.(int)
 	})
-	defer patchSetContext.Unpatch()
+	defer patchSetContext.Reset()
 
 	initRes := FLBPluginInit(nil)
 
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		return setID
+		if ctx != nil {
+			return *(*int)(ctx)
+		}
+		return 0
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
@@ -443,15 +446,15 @@ func TestFLBPluginFlushCtx(t *testing.T) {
 	}
 	defer func() { pluginGetResult = origResultFunc }()
 
-	patchDecoder := monkey.Patch(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	patchDecoder := gomonkey.ApplyFunc(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
 		checks.createDecoder++
 		return nil
 	})
-	defer patchDecoder.Unpatch()
+	defer patchDecoder.Reset()
 
 	var rowSent int = 0
 	var rowCount int = 5
-	patchRecord := monkey.Patch(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
+	patchRecord := gomonkey.ApplyFunc(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
 		checks.gotRecord++
 		dummyRecord := make(map[interface{}]interface{})
 		if rowSent < rowCount {
@@ -466,11 +469,11 @@ func TestFLBPluginFlushCtx(t *testing.T) {
 		rowSent = 0
 		return 1, nil, nil
 	})
-	defer patchRecord.Unpatch()
+	defer patchRecord.Reset()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
-	uintptrValue := uintptr(setID)
-	pointerValue := unsafe.Pointer(uintptrValue)
+	// Use the address of setID instead of its value
+	pointerValue := unsafe.Pointer(&setID)
 
 	// Calls FlushCtx with this ID
 	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
@@ -521,7 +524,7 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 	}
 
 	// Patches config key to set values
-	patch1 := monkey.Patch(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+	patch1 := gomonkey.ApplyFunc(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
 		switch key {
 		case "Max_Chunk_Size":
 			return "0"
@@ -533,7 +536,7 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 			return ""
 		}
 	})
-	defer patch1.Unpatch()
+	defer patch1.Reset()
 
 	// Returns mock client instead of an actual one
 	originalFunc := getClient
@@ -593,10 +596,10 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 	}
 	defer func() { getWriter = origFunc }()
 
-	patchSetContext := monkey.Patch(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+	patchSetContext := gomonkey.ApplyFunc(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
 		setID = ctx.(int)
 	})
-	defer patchSetContext.Unpatch()
+	defer patchSetContext.Reset()
 
 	patchSetThreshold := setThreshold
 	setThreshold = func(queueSize int) int {
@@ -628,15 +631,15 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 	}
 	defer func() { pluginGetResult = origResultFunc }()
 
-	patchDecoder := monkey.Patch(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	patchDecoder := gomonkey.ApplyFunc(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
 		return nil
 	})
-	defer patchDecoder.Unpatch()
+	defer patchDecoder.Reset()
 
 	// Sending rows and data
 	var rowSent int = 0
 	var rowCount int = 5
-	patchRecord := monkey.Patch(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
+	patchRecord := gomonkey.ApplyFunc(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
 		dummyRecord := make(map[interface{}]interface{})
 		if rowSent < rowCount {
 			rowSent++
@@ -650,10 +653,10 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 		rowSent = 0
 		return 1, nil, nil
 	})
-	defer patchRecord.Unpatch()
+	defer patchRecord.Reset()
 
 	// Creates new stream with a mock buildStream function to count the number of times we scale up
-	patchBuild := monkey.Patch(buildStream, func(ctx context.Context, config **outputConfig, streamIndex int) error {
+	patchBuild := gomonkey.ApplyFunc(buildStream, func(ctx context.Context, config **outputConfig, streamIndex int) error {
 		checks.buildStreamCalled++
 		currManagedStream, err := getWriter((*config).client, ctx, (*config).currProjectID,
 			managedwriter.WithType((*config).streamType),
@@ -672,11 +675,11 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 		}
 		return nil
 	})
-	defer patchBuild.Unpatch()
+	defer patchBuild.Reset()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
-	uintptrValue := uintptr(setID)
-	pointerValue := unsafe.Pointer(uintptrValue)
+	// Use the address of setID instead of its value
+	pointerValue := unsafe.Pointer(&setID)
 
 	// Calls FlushCtx with this ID
 	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
@@ -770,7 +773,7 @@ func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 	}
 	defer func() { getWriter = origFunc }()
 
-	patch1 := monkey.Patch(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+	patch1 := gomonkey.ApplyFunc(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
 		switch key {
 		case "Exactly_Once":
 			return "True"
@@ -778,19 +781,22 @@ func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 			return ""
 		}
 	})
-	defer patch1.Unpatch()
+	defer patch1.Reset()
 
-	patchSetContext := monkey.Patch(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+	patchSetContext := gomonkey.ApplyFunc(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
 		setID = ctx.(int)
 	})
-	defer patchSetContext.Unpatch()
+	defer patchSetContext.Reset()
 
 	initRes := FLBPluginInit(nil)
 
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		return setID
+		if ctx != nil {
+			return *(*int)(ctx)
+		}
+		return 0
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
@@ -808,15 +814,15 @@ func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 	}
 	defer func() { pluginGetResult = origResultFunc }()
 
-	patchDecoder := monkey.Patch(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	patchDecoder := gomonkey.ApplyFunc(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
 		checks.createDecoder++
 		return nil
 	})
-	defer patchDecoder.Unpatch()
+	defer patchDecoder.Reset()
 
 	var rowSent int = 0
 	var rowCount int = 5
-	patchRecord := monkey.Patch(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
+	patchRecord := gomonkey.ApplyFunc(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
 		checks.gotRecord++
 		dummyRecord := make(map[interface{}]interface{})
 		if rowSent < rowCount {
@@ -831,11 +837,11 @@ func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 		rowSent = 0
 		return 1, nil, nil
 	})
-	defer patchRecord.Unpatch()
+	defer patchRecord.Reset()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
-	uintptrValue := uintptr(setID)
-	pointerValue := unsafe.Pointer(uintptrValue)
+	// Use the address of setID instead of its value
+	pointerValue := unsafe.Pointer(&setID)
 
 	// Calls FlushCtx with this ID
 	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
@@ -940,7 +946,7 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	}
 	defer func() { getWriter = origFunc }()
 
-	patch1 := monkey.Patch(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+	patch1 := gomonkey.ApplyFunc(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
 		switch key {
 		case "Exactly_Once":
 			return "True"
@@ -948,19 +954,22 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 			return ""
 		}
 	})
-	defer patch1.Unpatch()
+	defer patch1.Reset()
 
-	patchSetContext := monkey.Patch(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+	patchSetContext := gomonkey.ApplyFunc(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
 		setID = ctx.(int)
 	})
-	defer patchSetContext.Unpatch()
+	defer patchSetContext.Reset()
 
 	initRes := FLBPluginInit(nil)
 
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		return setID
+		if ctx != nil {
+			return *(*int)(ctx)
+		}
+		return 0
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
@@ -986,15 +995,15 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	}
 	defer func() { pluginGetResult = origResultFunc }()
 
-	patchDecoder := monkey.Patch(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	patchDecoder := gomonkey.ApplyFunc(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
 		checks.createDecoder++
 		return nil
 	})
-	defer patchDecoder.Unpatch()
+	defer patchDecoder.Reset()
 
 	var rowSent int = 0
 	var rowCount int = 5
-	patchRecord := monkey.Patch(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
+	patchRecord := gomonkey.ApplyFunc(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
 		checks.gotRecord++
 		dummyRecord := make(map[interface{}]interface{})
 		if rowSent < rowCount {
@@ -1009,11 +1018,11 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 		rowSent = 0
 		return 1, nil, nil
 	})
-	defer patchRecord.Unpatch()
+	defer patchRecord.Reset()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
-	uintptrValue := uintptr(setID)
-	pointerValue := unsafe.Pointer(uintptrValue)
+	// Use the address of setID instead of its value
+	pointerValue := unsafe.Pointer(&setID)
 
 	// Calls FlushCtx with this ID
 	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)

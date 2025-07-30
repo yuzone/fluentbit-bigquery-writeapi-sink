@@ -5,9 +5,9 @@ go 1.23.0
 toolchain go1.24.5
 
 require (
-	bou.ke/monkey v1.0.2
 	cloud.google.com/go v0.121.4
 	cloud.google.com/go/bigquery v1.69.0
+	github.com/agiledragon/gomonkey/v2 v2.13.0
 	github.com/fluent/fluent-bit-go v0.0.0-20230731091245-a7a013e2473c
 	github.com/googleapis/gax-go/v2 v2.15.0
 	github.com/stretchr/testify v1.10.0
@@ -27,8 +27,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/goccy/go-json v0.10.2 // indirect
-	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
-	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/flatbuffers v23.5.26+incompatible // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
