@@ -81,6 +81,7 @@ const (
 	maxNumStreamsPerInstance   = 10
 	minQueueRequests           = 10
 	dateTimeDefault            = true
+	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC in seconds
 )
 
 // This function mangles the top-level and complex (struct) BigQuery schema to convert NUMERIC, BIGNUMERIC, DATETIME, TIME, and JSON fields to STRING.
@@ -225,6 +226,34 @@ func parseSlice(sliceInterface []interface{}) []interface{} {
 		}
 	}
 	return result
+}
+
+// Convert timestamp fields from seconds to microseconds for BigQuery Storage Write API
+// BigQuery TIMESTAMP type expects microseconds since Unix epoch
+func convertTimestampFields(data map[string]interface{}, timestampFields []string) {
+	for _, field := range timestampFields {
+		if val, ok := data[field]; ok {
+			switch v := val.(type) {
+			case int64:
+				// If value looks like seconds (less than year 2100 in seconds), convert to microseconds
+				if v > 0 && v < maxUnixSeconds {
+					data[field] = v * 1000000
+				}
+			case int:
+				if v > 0 && v < maxUnixSeconds {
+					data[field] = int64(v) * 1000000
+				}
+			case uint64:
+				if v > 0 && v < maxUnixSeconds {
+					data[field] = int64(v) * 1000000
+				}
+			case float64:
+				if v > 0 && v < maxUnixSeconds {
+					data[field] = int64(v * 1000000)
+				}
+			}
+		}
+	}
 }
 
 var isReady = func(result *managedwriter.AppendResult) bool {
@@ -743,6 +772,9 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		}
 
 		rowJSONMap := parseMap(record)
+
+		// Convert timestamp fields from seconds to microseconds for BigQuery Storage Write API
+		convertTimestampFields(rowJSONMap, []string{"time"})
 
 		// Serialize data
 		// Transform each row of data into binary using the jsonToBinary function and the message descriptor from the getDescriptors function

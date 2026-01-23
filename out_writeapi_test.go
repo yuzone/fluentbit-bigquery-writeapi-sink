@@ -1288,3 +1288,111 @@ func TestParseSlice(t *testing.T) {
 		})
 	}
 }
+
+// TestConvertTimestampFields tests the convertTimestampFields function
+func TestConvertTimestampFields(t *testing.T) {
+	tests := []struct {
+		name            string
+		input           map[string]interface{}
+		timestampFields []string
+		expected        map[string]interface{}
+	}{
+		{
+			name:            "int64 seconds converted to microseconds",
+			input:           map[string]interface{}{"time": int64(1700000000)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(1700000000000000)},
+		},
+		{
+			name:            "int seconds converted to microseconds",
+			input:           map[string]interface{}{"time": 1700000000},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(1700000000000000)},
+		},
+		{
+			name:            "uint64 seconds converted to microseconds",
+			input:           map[string]interface{}{"time": uint64(1700000000)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(1700000000000000)},
+		},
+		{
+			name:            "float64 seconds converted to microseconds",
+			input:           map[string]interface{}{"time": float64(1700000000.5)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(1700000000500000)},
+		},
+		{
+			name:            "value already in microseconds not converted",
+			input:           map[string]interface{}{"time": int64(1700000000000000)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(1700000000000000)},
+		},
+		{
+			name:            "boundary value at maxUnixSeconds not converted",
+			input:           map[string]interface{}{"time": int64(4102444800)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(4102444800)},
+		},
+		{
+			name:            "boundary value just below maxUnixSeconds converted",
+			input:           map[string]interface{}{"time": int64(4102444799)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(4102444799000000)},
+		},
+		{
+			name:            "zero value not converted",
+			input:           map[string]interface{}{"time": int64(0)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(0)},
+		},
+		{
+			name:            "negative value not converted",
+			input:           map[string]interface{}{"time": int64(-1000)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(-1000)},
+		},
+		{
+			name:            "field not in timestampFields not converted",
+			input:           map[string]interface{}{"time": int64(1700000000), "other": int64(1700000000)},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": int64(1700000000000000), "other": int64(1700000000)},
+		},
+		{
+			name:            "multiple timestamp fields",
+			input:           map[string]interface{}{"time": int64(1700000000), "created_at": int64(1600000000)},
+			timestampFields: []string{"time", "created_at"},
+			expected:        map[string]interface{}{"time": int64(1700000000000000), "created_at": int64(1600000000000000)},
+		},
+		{
+			name:            "field not present in data",
+			input:           map[string]interface{}{"other": "value"},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"other": "value"},
+		},
+		{
+			name:            "string value not converted",
+			input:           map[string]interface{}{"time": "2023-11-14T00:00:00Z"},
+			timestampFields: []string{"time"},
+			expected:        map[string]interface{}{"time": "2023-11-14T00:00:00Z"},
+		},
+		{
+			name:            "empty timestamp fields",
+			input:           map[string]interface{}{"time": int64(1700000000)},
+			timestampFields: []string{},
+			expected:        map[string]interface{}{"time": int64(1700000000)},
+		},
+		{
+			name:            "nil timestamp fields",
+			input:           map[string]interface{}{"time": int64(1700000000)},
+			timestampFields: nil,
+			expected:        map[string]interface{}{"time": int64(1700000000)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			convertTimestampFields(tt.input, tt.timestampFields)
+			assert.Equal(t, tt.expected, tt.input)
+		})
+	}
+}
