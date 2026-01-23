@@ -186,6 +186,9 @@ func jsonToBinary(message_descriptor protoreflect.MessageDescriptor, jsonRow map
 // From https://github.com/majst01/fluent-bit-go-redis-output.git
 // Function is used to transform fluent-bit record to a JSON map
 func parseMap(mapInterface map[interface{}]interface{}) map[string]interface{} {
+	if mapInterface == nil {
+		return nil
+	}
 	m := make(map[string]interface{})
 	for k, v := range mapInterface {
 		switch t := v.(type) {
