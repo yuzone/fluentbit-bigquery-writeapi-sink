@@ -197,11 +197,34 @@ func parseMap(mapInterface map[interface{}]interface{}) map[string]interface{} {
 			m[k.(string)] = string(t)
 		case map[interface{}]interface{}:
 			m[k.(string)] = parseMap(t)
+		case []interface{}:
+			m[k.(string)] = parseSlice(t)
 		default:
 			m[k.(string)] = v
 		}
 	}
 	return m
+}
+
+// Function to handle slices that may contain nested maps
+func parseSlice(sliceInterface []interface{}) []interface{} {
+	if sliceInterface == nil {
+		return nil
+	}
+	result := make([]interface{}, len(sliceInterface))
+	for i, v := range sliceInterface {
+		switch t := v.(type) {
+		case []byte:
+			result[i] = string(t)
+		case map[interface{}]interface{}:
+			result[i] = parseMap(t)
+		case []interface{}:
+			result[i] = parseSlice(t)
+		default:
+			result[i] = v
+		}
+	}
+	return result
 }
 
 var isReady = func(result *managedwriter.AppendResult) bool {

@@ -1117,13 +1117,12 @@ func TestParseMap(t *testing.T) {
 					},
 				},
 			},
-			// Note: parseMap does not recursively process elements inside slices
 			expected: map[string]interface{}{
 				"items": []interface{}{
-					map[interface{}]interface{}{
+					map[string]interface{}{
 						"name": "item1",
 					},
-					map[interface{}]interface{}{
+					map[string]interface{}{
 						"name": "item2",
 					},
 				},
@@ -1137,11 +1136,10 @@ func TestParseMap(t *testing.T) {
 					[]byte("second"),
 				},
 			},
-			// Note: parseMap does not recursively process elements inside slices
 			expected: map[string]interface{}{
 				"data": []interface{}{
-					[]byte("first"),
-					[]byte("second"),
+					"first",
+					"second",
 				},
 			},
 		},
@@ -1180,13 +1178,12 @@ func TestParseMap(t *testing.T) {
 					},
 				},
 			},
-			// Note: parseMap does not recursively process elements inside slices
 			expected: map[string]interface{}{
 				"level1": map[string]interface{}{
 					"level2": map[string]interface{}{
 						"level3": []interface{}{
-							map[interface{}]interface{}{
-								"data": []byte("deep"),
+							map[string]interface{}{
+								"data": "deep",
 							},
 						},
 					},
@@ -1221,6 +1218,72 @@ func TestParseMap(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := parseMap(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestParseSlice tests the parseSlice function
+func TestParseSlice(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []interface{}
+		expected []interface{}
+	}{
+		{
+			name:     "nil slice returns nil",
+			input:    nil,
+			expected: nil,
+		},
+		{
+			name:     "empty slice",
+			input:    []interface{}{},
+			expected: []interface{}{},
+		},
+		{
+			name:     "simple values",
+			input:    []interface{}{"a", "b", "c"},
+			expected: []interface{}{"a", "b", "c"},
+		},
+		{
+			name:     "byte slice converted to string",
+			input:    []interface{}{[]byte("hello"), []byte("world")},
+			expected: []interface{}{"hello", "world"},
+		},
+		{
+			name: "nested map in slice",
+			input: []interface{}{
+				map[interface{}]interface{}{
+					"key": "value",
+				},
+			},
+			expected: []interface{}{
+				map[string]interface{}{
+					"key": "value",
+				},
+			},
+		},
+		{
+			name: "nested slice",
+			input: []interface{}{
+				[]interface{}{1, 2, 3},
+				[]interface{}{"a", "b"},
+			},
+			expected: []interface{}{
+				[]interface{}{1, 2, 3},
+				[]interface{}{"a", "b"},
+			},
+		},
+		{
+			name:     "mixed types",
+			input:    []interface{}{"string", []byte("bytes"), 42, true},
+			expected: []interface{}{"string", "bytes", 42, true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := parseSlice(tt.input)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
