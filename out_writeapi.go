@@ -514,7 +514,7 @@ var getWriter = func(client ManagedWriterClient, ctx context.Context, projectID 
 // Mock it whenever needed
 var getFLBPluginContext = func(ctx unsafe.Pointer) int {
 	if ctx != nil {
-		return *(*int)(ctx)
+		return output.FLBPluginGetContext(ctx).(int)
 	}
 	return 0
 }
