@@ -1,35 +1,28 @@
 name: Test
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: ['1.23.0', '1.24.0']
-    
     steps:
-    - uses: actions/checkout@v5
-    
+    - uses: actions/checkout@v6
+
     - name: Set up Go
       uses: actions/setup-go@v6
       with:
-        go-version: ${{ matrix.go-version }}
-    
+        go-version: '1.25'
+
     - name: Get dependencies
       run: go mod download
-    
+
     - name: Build plugin
       run: go build -buildmode=c-shared -o out_writeapi.so
-    
+
     - name: Run tests
       run: go test -v -gcflags=all=-l -skip "^Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandlingExactlyOnce|DefaultValue)$"
-    
+
     - name: Run integration tests
       # Integration tests require GCP credentials
       if: ${{ env.GCP_PROJECT_ID != '' }}
