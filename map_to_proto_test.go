@@ -36,10 +36,12 @@ func buildMD(t *testing.T, schema *storagepb.TableSchema) protoreflect.MessageDe
 	return md
 }
 
-// helper: mapToBinary then unmarshal back to dynamicpb.Message for assertions
+// helper: mapToBinary then unmarshal back to dynamicpb.Message for assertions.
+// Builds a fieldLookupCache to exercise the cached path (same as production).
 func roundTrip(t *testing.T, md protoreflect.MessageDescriptor, data map[string]interface{}) *dynamicpb.Message {
 	t.Helper()
-	b, err := mapToBinary(md, data)
+	cache := buildFieldLookupCache(md)
+	b, err := mapToBinary(md, data, cache)
 	require.NoError(t, err)
 	msg := dynamicpb.NewMessage(md)
 	require.NoError(t, proto.Unmarshal(b, msg))
@@ -424,7 +426,7 @@ func TestMapToBinary_EmptyMap(t *testing.T) {
 	}
 	md := buildMD(t, schema)
 
-	b, err := mapToBinary(md, map[string]interface{}{})
+	b, err := mapToBinary(md, map[string]interface{}{}, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, b)
 }
@@ -529,7 +531,7 @@ func TestMapToBinary_MatchesOriginalJsonToBinary(t *testing.T) {
 		"Time": "000",
 	}
 
-	b, err := mapToBinary(md, data)
+	b, err := mapToBinary(md, data, buildFieldLookupCache(md))
 	require.NoError(t, err)
 
 	msg := dynamicpb.NewMessage(md)
@@ -552,7 +554,7 @@ func TestMapToBinary_RepeatedEmpty(t *testing.T) {
 		"tags": []interface{}{},
 	}
 
-	b, err := mapToBinary(md, data)
+	b, err := mapToBinary(md, data, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, b)
 }
@@ -576,17 +578,17 @@ func TestMapToBinary_ErrorCases(t *testing.T) {
 	md := buildMD(t, schema)
 
 	t.Run("invalid int64 string", func(t *testing.T) {
-		_, err := mapToBinary(md, map[string]interface{}{"count": "not-a-number"})
+		_, err := mapToBinary(md, map[string]interface{}{"count": "not-a-number"}, nil)
 		assert.Error(t, err)
 	})
 
 	t.Run("non-map for message field", func(t *testing.T) {
-		_, err := mapToBinary(md, map[string]interface{}{"nested": "not-a-map"})
+		_, err := mapToBinary(md, map[string]interface{}{"nested": "not-a-map"}, nil)
 		assert.Error(t, err)
 	})
 
 	t.Run("non-slice for repeated field", func(t *testing.T) {
-		_, err := mapToBinary(md, map[string]interface{}{"items": "not-a-slice"})
+		_, err := mapToBinary(md, map[string]interface{}{"items": "not-a-slice"}, nil)
 		assert.Error(t, err)
 	})
 }
@@ -627,6 +629,7 @@ func BenchmarkMapToBinary(b *testing.B) {
 	}, true)
 	descriptor, _ := adapt.StorageSchemaToProto2Descriptor(schema, "root")
 	md := descriptor.(protoreflect.MessageDescriptor)
+	cache := buildFieldLookupCache(md)
 
 	data := map[string]interface{}{
 		"name":        "test-user",
@@ -641,7 +644,7 @@ func BenchmarkMapToBinary(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, err := mapToBinary(md, data)
+		_, err := mapToBinary(md, data, cache)
 		if err != nil {
 			b.Fatal(err)
 		}

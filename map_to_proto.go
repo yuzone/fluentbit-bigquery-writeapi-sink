@@ -17,44 +17,116 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strconv"
+	"sync"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+// fieldLookupCache maps a proto message's full name to a map of
+// field-name → FieldDescriptor. Built once at Init time and shared
+// across all Flush calls to avoid per-row reflection lookups.
+type fieldLookupCache map[protoreflect.FullName]map[string]protoreflect.FieldDescriptor
+
+// buildFieldLookupCache walks the MessageDescriptor tree and builds
+// an O(1) lookup table for every message (including nested STRUCTs).
+func buildFieldLookupCache(md protoreflect.MessageDescriptor) fieldLookupCache {
+	cache := make(fieldLookupCache)
+	buildFieldCacheRecursive(md, cache)
+	return cache
+}
+
+func buildFieldCacheRecursive(md protoreflect.MessageDescriptor, cache fieldLookupCache) {
+	fullName := md.FullName()
+	if _, exists := cache[fullName]; exists {
+		return
+	}
+	fields := md.Fields()
+	m := make(map[string]protoreflect.FieldDescriptor, fields.Len()*2)
+	for i := 0; i < fields.Len(); i++ {
+		f := fields.Get(i)
+		m[string(f.Name())] = f
+		if jn := f.JSONName(); jn != string(f.Name()) {
+			m[jn] = f
+		}
+		if f.Kind() == protoreflect.MessageKind || f.Kind() == protoreflect.GroupKind {
+			buildFieldCacheRecursive(f.Message(), cache)
+		}
+	}
+	cache[fullName] = m
+}
+
+// marshalBufPool recycles scratch buffers used by proto.MarshalAppend,
+// avoiding a fresh heap allocation on every row in the hot path.
+// The pool buffer is never returned to callers — data is copied out.
+var marshalBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 0, 256)
+		return &buf
+	},
+}
+
 // mapToBinary converts a map[string]interface{} directly to proto binary format,
 // bypassing the intermediate JSON serialization (json.Marshal + protojson.Unmarshal)
 // that the previous jsonToBinary implementation used.
-// This eliminates two of the three serialization steps in the hot path.
-func mapToBinary(md protoreflect.MessageDescriptor, data map[string]interface{}) ([]byte, error) {
-	msg, err := mapToMessage(md, data)
+//
+// cache may be nil — in that case every field lookup falls back to
+// ByName + linear JSON-name scan (still correct, just slower).
+func mapToBinary(md protoreflect.MessageDescriptor, data map[string]interface{}, cache fieldLookupCache) ([]byte, error) {
+	msg, err := mapToMessage(md, data, cache)
 	if err != nil {
 		return nil, err
 	}
-	return proto.Marshal(msg)
+
+	// Marshal into a pooled scratch buffer, then copy the result out.
+	bufp := marshalBufPool.Get().(*[]byte)
+	b, err := proto.MarshalOptions{}.MarshalAppend((*bufp)[:0], msg)
+	if err != nil {
+		*bufp = b
+		marshalBufPool.Put(bufp)
+		return nil, err
+	}
+
+	result := make([]byte, len(b))
+	copy(result, b)
+
+	*bufp = b // preserve grown capacity for next use
+	marshalBufPool.Put(bufp)
+
+	return result, nil
 }
 
 // mapToMessage populates a dynamicpb.Message directly from a map[string]interface{}.
 // It iterates the message descriptor's fields, looks up each field's name in the map,
 // and sets the corresponding proto value.
-func mapToMessage(md protoreflect.MessageDescriptor, data map[string]interface{}) (*dynamicpb.Message, error) {
+func mapToMessage(md protoreflect.MessageDescriptor, data map[string]interface{}, cache fieldLookupCache) (*dynamicpb.Message, error) {
 	msg := dynamicpb.NewMessage(md)
-	fields := md.Fields()
+
+	// Use pre-built field map when available (O(1) per key).
+	var fieldMap map[string]protoreflect.FieldDescriptor
+	if cache != nil {
+		fieldMap = cache[md.FullName()]
+	}
 
 	for key, val := range data {
 		if val == nil {
 			continue
 		}
 
-		fd := findFieldDescriptor(fields, key)
+		var fd protoreflect.FieldDescriptor
+		if fieldMap != nil {
+			fd = fieldMap[key]
+		} else {
+			fd = findFieldDescriptor(md.Fields(), key)
+		}
 		if fd == nil {
 			// Skip unknown fields (consistent with protojson DiscardUnknown behavior)
 			continue
 		}
 
 		if fd.IsList() {
-			if err := setRepeatedField(msg, fd, val); err != nil {
+			if err := setRepeatedField(msg, fd, val, cache); err != nil {
 				return nil, fmt.Errorf("field %q: %w", key, err)
 			}
 		} else if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
@@ -62,7 +134,7 @@ func mapToMessage(md protoreflect.MessageDescriptor, data map[string]interface{}
 			if !ok {
 				return nil, fmt.Errorf("field %q: expected map for message field, got %T", key, val)
 			}
-			subMsg, err := mapToMessage(fd.Message(), subMap)
+			subMsg, err := mapToMessage(fd.Message(), subMap, cache)
 			if err != nil {
 				return nil, fmt.Errorf("field %q: %w", key, err)
 			}
@@ -100,7 +172,7 @@ func findFieldDescriptor(fields protoreflect.FieldDescriptors, key string) proto
 }
 
 // setRepeatedField populates a repeated (list) proto field from a Go slice.
-func setRepeatedField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, val interface{}) error {
+func setRepeatedField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, val interface{}, cache fieldLookupCache) error {
 	slice, ok := val.([]interface{})
 	if !ok {
 		return fmt.Errorf("expected []interface{} for repeated field, got %T", val)
@@ -119,7 +191,7 @@ func setRepeatedField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, v
 			if !ok {
 				return fmt.Errorf("element %d: expected map for repeated message, got %T", i, item)
 			}
-			subMsg, err := mapToMessage(fd.Message(), subMap)
+			subMsg, err := mapToMessage(fd.Message(), subMap, cache)
 			if err != nil {
 				return fmt.Errorf("element %d: %w", i, err)
 			}
