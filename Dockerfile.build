@@ -13,7 +13,7 @@ COPY . .
 
 # c-shared (CGO required)
 RUN CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -o /out_writeapi.so \
-    out_writeapi.go retry.go
+    out_writeapi.go retry.go map_to_proto.go
 
 # ---- artifact stage
 FROM scratch AS artifact

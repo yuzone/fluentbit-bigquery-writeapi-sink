@@ -16,7 +16,6 @@ package main
 import (
 	"C"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -32,11 +31,9 @@ import (
 	"github.com/fluent/fluent-bit-go/output"
 	"github.com/googleapis/gax-go/v2"
 	"github.com/googleapis/gax-go/v2/apierror"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
-	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 // Struct for each stream - can be multiple per output
@@ -64,6 +61,7 @@ type outputConfig struct {
 	requestCountThreshold int
 	numRetries            int
 	timestampFields       []string
+	fieldCache            fieldLookupCache
 }
 
 var (
@@ -186,30 +184,12 @@ func getDescriptors(curr_ctx context.Context, mw_client ManagedWriterClient, pro
 	return messageDescriptor, dp, timestampFields, nil
 }
 
-// This function handles the data transformation from JSON to binary for a single json row.
+// This function handles the data transformation from a Go map to binary for a single row.
+// It populates the proto message directly from the map, bypassing the intermediate
+// JSON serialization (json.Marshal + protojson.Unmarshal) for better performance.
 // The outputs of this function are the corresponding binary data as well as any error that occur.
-func jsonToBinary(message_descriptor protoreflect.MessageDescriptor, jsonRow map[string]interface{}) ([]byte, error) {
-	// JSON map -> JSON byte
-	row, err := json.Marshal(jsonRow)
-	if err != nil {
-		return nil, err
-	}
-	// Create empty message
-	message := dynamicpb.NewMessage(message_descriptor)
-
-	// First, json byte -> proto message
-	err = protojson.Unmarshal(row, message)
-	if err != nil {
-		return nil, err
-	}
-
-	// Then, proto message -> bytes.
-	b, err := proto.Marshal(message)
-	if err != nil {
-		return nil, err
-	}
-
-	return b, nil
+func jsonToBinary(message_descriptor protoreflect.MessageDescriptor, jsonRow map[string]interface{}, cache fieldLookupCache) ([]byte, error) {
+	return mapToBinary(message_descriptor, jsonRow, cache)
 }
 
 // From https://github.com/majst01/fluent-bit-go-redis-output.git
@@ -761,6 +741,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		requestCountThreshold: requestCountThreshold,
 		managedStreamSlice:    &streamSlice,
 		timestampFields:       timestampFields,
+		fieldCache:            buildFieldLookupCache(md),
 	}
 
 	// Create stream using NewManagedStream
@@ -806,7 +787,8 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 	// Create Fluent Bit decoder
 	dec := output.NewDecoder(data, int(length))
-	var binaryData [][]byte
+	// Pre-allocate binaryData slice to reduce append-driven growth (#5)
+	binaryData := make([][]byte, 0, 256)
 	var currsize int
 	// Keeps track of the number of rows previously sent
 	var rowCounter int64
@@ -831,7 +813,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 		// Serialize data
 		// Transform each row of data into binary using the jsonToBinary function and the message descriptor from the getDescriptors function
-		buf, err := jsonToBinary(config.messageDescriptor, rowJSONMap)
+		buf, err := jsonToBinary(config.messageDescriptor, rowJSONMap, config.fieldCache)
 		if err != nil {
 			log.Printf("Transforming row with value:%s from JSON to binary data for output instance with id: %d failed in FLBPluginFlushCtx: %s", rowJSONMap, id, err)
 		} else {
@@ -849,7 +831,8 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 				rowCounter = 0
 
-				binaryData = nil
+				// Reuse the underlying array instead of nil to avoid re-allocation
+				binaryData = binaryData[:0]
 				currsize = 0
 
 			}
