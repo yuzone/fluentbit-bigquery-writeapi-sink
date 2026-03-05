@@ -67,21 +67,49 @@ var marshalBufPool = sync.Pool{
 	},
 }
 
-// mapToBinary converts a map[string]interface{} directly to proto binary format,
-// bypassing the intermediate JSON serialization (json.Marshal + protojson.Unmarshal)
-// that the previous jsonToBinary implementation used.
-//
-// cache may be nil — in that case every field lookup falls back to
-// ByName + linear JSON-name scan (still correct, just slower).
-func mapToBinary(md protoreflect.MessageDescriptor, data map[string]interface{}, cache fieldLookupCache) ([]byte, error) {
-	msg, err := mapToMessage(md, data, cache)
-	if err != nil {
-		return nil, err
-	}
+// messagePool caches *dynamicpb.Message instances keyed by MessageDescriptor
+// identity to avoid per-row heap allocations in the hot path.
+// We key by the descriptor itself (not FullName) because dynamicpb.Message.Set
+// requires the field descriptor to belong to the exact same MessageDescriptor
+// instance that was used to create the message.
+var messagePool sync.Map // protoreflect.MessageDescriptor → *sync.Pool
 
-	// Marshal into a pooled scratch buffer, then copy the result out.
+// getPooledMessage retrieves a dynamicpb.Message from the pool,
+// or creates a new one if the pool is empty.
+func getPooledMessage(md protoreflect.MessageDescriptor) *dynamicpb.Message {
+	p, ok := messagePool.Load(md)
+	if !ok {
+		p, _ = messagePool.LoadOrStore(md, &sync.Pool{
+			New: func() interface{} {
+				return dynamicpb.NewMessage(md)
+			},
+		})
+	}
+	return p.(*sync.Pool).Get().(*dynamicpb.Message)
+}
+
+// putPooledMessage clears all populated fields and returns the message to the pool.
+// Clearing via Range+Clear preserves internal map bucket memory so that
+// subsequent reuse avoids re-growing the map.
+func putPooledMessage(msg *dynamicpb.Message) {
+	msg.Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		msg.Clear(fd)
+		return true
+	})
+	if p, ok := messagePool.Load(msg.Descriptor()); ok {
+		p.(*sync.Pool).Put(msg)
+	}
+}
+
+// marshalAndRelease marshals a pooled dynamicpb.Message to bytes,
+// then returns the message to the pool. Handles buffer pooling internally.
+func marshalAndRelease(msg *dynamicpb.Message) ([]byte, error) {
 	bufp := marshalBufPool.Get().(*[]byte)
 	b, err := proto.MarshalOptions{}.MarshalAppend((*bufp)[:0], msg)
+
+	// Return message to pool (clears fields, preserves map capacity)
+	putPooledMessage(msg)
+
 	if err != nil {
 		*bufp = b
 		marshalBufPool.Put(bufp)
@@ -97,12 +125,50 @@ func mapToBinary(md protoreflect.MessageDescriptor, data map[string]interface{},
 	return result, nil
 }
 
-// mapToMessage populates a dynamicpb.Message directly from a map[string]interface{}.
-// It iterates the message descriptor's fields, looks up each field's name in the map,
-// and sets the corresponding proto value.
+// mapToBinary converts a map[string]interface{} directly to proto binary format,
+// bypassing intermediate JSON serialization for better performance.
+//
+// cache may be nil — in that case every field lookup falls back to
+// ByName + linear JSON-name scan (still correct, just slower).
+func mapToBinary(md protoreflect.MessageDescriptor, data map[string]interface{}, cache fieldLookupCache) ([]byte, error) {
+	// Get a pooled top-level message to avoid per-row allocation
+	msg := getPooledMessage(md)
+
+	if err := populateMessage(msg, md, data, cache); err != nil {
+		putPooledMessage(msg)
+		return nil, err
+	}
+
+	return marshalAndRelease(msg)
+}
+
+// rawMapToBinary converts a map[interface{}]interface{} (raw Fluent Bit record)
+// directly to proto binary, avoiding intermediate map allocation.
+// It also uses a pooled top-level message
+func rawMapToBinary(md protoreflect.MessageDescriptor, rawData map[interface{}]interface{}, cache fieldLookupCache) ([]byte, error) {
+	msg := getPooledMessage(md)
+
+	if err := rawPopulateMessage(msg, md, rawData, cache); err != nil {
+		putPooledMessage(msg)
+		return nil, err
+	}
+
+	return marshalAndRelease(msg)
+}
+
+// mapToMessage creates a new dynamicpb.Message and populates it from a map[string]interface{}.
+// Used for nested sub-messages (which are not pooled).
 func mapToMessage(md protoreflect.MessageDescriptor, data map[string]interface{}, cache fieldLookupCache) (*dynamicpb.Message, error) {
 	msg := dynamicpb.NewMessage(md)
+	if err := populateMessage(msg, md, data, cache); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
 
+// populateMessage fills an existing dynamicpb.Message from a map[string]interface{}.
+// Extracted from mapToMessage so that callers can supply a pooled message
+func populateMessage(msg *dynamicpb.Message, md protoreflect.MessageDescriptor, data map[string]interface{}, cache fieldLookupCache) error {
 	// Use pre-built field map when available (O(1) per key).
 	var fieldMap map[string]protoreflect.FieldDescriptor
 	if cache != nil {
@@ -127,27 +193,89 @@ func mapToMessage(md protoreflect.MessageDescriptor, data map[string]interface{}
 
 		if fd.IsList() {
 			if err := setRepeatedField(msg, fd, val, cache); err != nil {
-				return nil, fmt.Errorf("field %q: %w", key, err)
+				return fmt.Errorf("field %q: %w", key, err)
 			}
 		} else if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
 			subMap, ok := val.(map[string]interface{})
 			if !ok {
-				return nil, fmt.Errorf("field %q: expected map for message field, got %T", key, val)
+				return fmt.Errorf("field %q: expected map for message field, got %T", key, val)
 			}
 			subMsg, err := mapToMessage(fd.Message(), subMap, cache)
 			if err != nil {
-				return nil, fmt.Errorf("field %q: %w", key, err)
+				return fmt.Errorf("field %q: %w", key, err)
 			}
 			msg.Set(fd, protoreflect.ValueOfMessage(subMsg))
 		} else {
 			pv, err := goToProtoScalar(fd, val)
 			if err != nil {
-				return nil, fmt.Errorf("field %q: %w", key, err)
+				return fmt.Errorf("field %q: %w", key, err)
 			}
 			msg.Set(fd, pv)
 		}
 	}
-	return msg, nil
+	return nil
+}
+
+// rawPopulateMessage fills a dynamicpb.Message directly from a raw Fluent Bit
+// record (map[interface{}]interface{}), handling key and value type conversions
+// inline.
+func rawPopulateMessage(msg *dynamicpb.Message, md protoreflect.MessageDescriptor, rawData map[interface{}]interface{}, cache fieldLookupCache) error {
+	var fieldMap map[string]protoreflect.FieldDescriptor
+	if cache != nil {
+		fieldMap = cache[md.FullName()]
+	}
+
+	for k, val := range rawData {
+		if val == nil {
+			continue
+		}
+
+		// Fluent Bit msgpack keys are always string-typed
+		key, ok := k.(string)
+		if !ok {
+			continue
+		}
+
+		var fd protoreflect.FieldDescriptor
+		if fieldMap != nil {
+			fd = fieldMap[key]
+		} else {
+			fd = findFieldDescriptor(md.Fields(), key)
+		}
+		if fd == nil {
+			continue
+		}
+
+		if fd.IsList() {
+			if err := rawSetRepeatedField(msg, fd, val, cache); err != nil {
+				return fmt.Errorf("field %q: %w", key, err)
+			}
+		} else if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
+			switch sub := val.(type) {
+			case map[interface{}]interface{}:
+				subMsg := dynamicpb.NewMessage(fd.Message())
+				if err := rawPopulateMessage(subMsg, fd.Message(), sub, cache); err != nil {
+					return fmt.Errorf("field %q: %w", key, err)
+				}
+				msg.Set(fd, protoreflect.ValueOfMessage(subMsg))
+			case map[string]interface{}:
+				subMsg, err := mapToMessage(fd.Message(), sub, cache)
+				if err != nil {
+					return fmt.Errorf("field %q: %w", key, err)
+				}
+				msg.Set(fd, protoreflect.ValueOfMessage(subMsg))
+			default:
+				return fmt.Errorf("field %q: expected map for message field, got %T", key, val)
+			}
+		} else {
+			pv, err := goToProtoScalar(fd, val)
+			if err != nil {
+				return fmt.Errorf("field %q: %w", key, err)
+			}
+			msg.Set(fd, pv)
+		}
+	}
+	return nil
 }
 
 // findFieldDescriptor looks up a field descriptor by name.
@@ -196,6 +324,50 @@ func setRepeatedField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, v
 				return fmt.Errorf("element %d: %w", i, err)
 			}
 			list.Append(protoreflect.ValueOfMessage(subMsg))
+		} else {
+			pv, err := goToProtoScalar(fd, item)
+			if err != nil {
+				return fmt.Errorf("element %d: %w", i, err)
+			}
+			list.Append(pv)
+		}
+	}
+	return nil
+}
+
+// rawSetRepeatedField populates a repeated proto field from a raw slice,
+// handling map[interface{}]interface{} elements for nested messages
+func rawSetRepeatedField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, val interface{}, cache fieldLookupCache) error {
+	slice, ok := val.([]interface{})
+	if !ok {
+		return fmt.Errorf("expected []interface{} for repeated field, got %T", val)
+	}
+	if len(slice) == 0 {
+		return nil
+	}
+
+	list := msg.Mutable(fd).List()
+	for i, item := range slice {
+		if item == nil {
+			continue
+		}
+		if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
+			switch sub := item.(type) {
+			case map[interface{}]interface{}:
+				subMsg := dynamicpb.NewMessage(fd.Message())
+				if err := rawPopulateMessage(subMsg, fd.Message(), sub, cache); err != nil {
+					return fmt.Errorf("element %d: %w", i, err)
+				}
+				list.Append(protoreflect.ValueOfMessage(subMsg))
+			case map[string]interface{}:
+				subMsg, err := mapToMessage(fd.Message(), sub, cache)
+				if err != nil {
+					return fmt.Errorf("element %d: %w", i, err)
+				}
+				list.Append(protoreflect.ValueOfMessage(subMsg))
+			default:
+				return fmt.Errorf("element %d: expected map for repeated message, got %T", i, item)
+			}
 		} else {
 			pv, err := goToProtoScalar(fd, item)
 			if err != nil {
@@ -285,6 +457,8 @@ func toProtoInt64(val interface{}) (protoreflect.Value, error) {
 			return protoreflect.ValueOfInt64(int64(f)), nil
 		}
 		return protoreflect.ValueOfInt64(i), nil
+	case []byte:
+		return toProtoInt64(string(v))
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to int64", val)
 	}
@@ -312,6 +486,8 @@ func toProtoInt32(val interface{}) (protoreflect.Value, error) {
 			return protoreflect.Value{}, fmt.Errorf("cannot convert string %q to int32: %w", v, err)
 		}
 		return protoreflect.ValueOfInt32(int32(i)), nil
+	case []byte:
+		return toProtoInt32(string(v))
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to int32", val)
 	}
@@ -335,6 +511,8 @@ func toProtoUint64(val interface{}) (protoreflect.Value, error) {
 			return protoreflect.Value{}, fmt.Errorf("cannot convert string %q to uint64: %w", v, err)
 		}
 		return protoreflect.ValueOfUint64(u), nil
+	case []byte:
+		return toProtoUint64(string(v))
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to uint64", val)
 	}
@@ -358,6 +536,8 @@ func toProtoUint32(val interface{}) (protoreflect.Value, error) {
 			return protoreflect.Value{}, fmt.Errorf("cannot convert string %q to uint32: %w", v, err)
 		}
 		return protoreflect.ValueOfUint32(uint32(u)), nil
+	case []byte:
+		return toProtoUint32(string(v))
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to uint32", val)
 	}
@@ -381,6 +561,8 @@ func toProtoDouble(val interface{}) (protoreflect.Value, error) {
 			return protoreflect.Value{}, fmt.Errorf("cannot convert string %q to float64: %w", v, err)
 		}
 		return protoreflect.ValueOfFloat64(f), nil
+	case []byte:
+		return toProtoDouble(string(v))
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to float64", val)
 	}
@@ -402,6 +584,8 @@ func toProtoFloat(val interface{}) (protoreflect.Value, error) {
 			return protoreflect.Value{}, fmt.Errorf("cannot convert string %q to float32: %w", v, err)
 		}
 		return protoreflect.ValueOfFloat32(float32(f)), nil
+	case []byte:
+		return toProtoFloat(string(v))
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to float32", val)
 	}
@@ -425,6 +609,8 @@ func toProtoBool(val interface{}) (protoreflect.Value, error) {
 		return protoreflect.ValueOfBool(v != 0), nil
 	case float64:
 		return protoreflect.ValueOfBool(v != 0), nil
+	case []byte:
+		return toProtoBool(string(v))
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to bool", val)
 	}
@@ -436,7 +622,8 @@ func toProtoBytes(val interface{}) (protoreflect.Value, error) {
 		return protoreflect.ValueOfBytes(v), nil
 	case string:
 		// protojson expects base64-encoded strings for bytes fields.
-		// Since parseMap converts []byte → string, attempt base64 decode first.
+		// Since Fluent Bit's msgpack decoder may produce []byte for string values,
+		// attempt base64 decode first.
 		b, err := base64.StdEncoding.DecodeString(v)
 		if err != nil {
 			// Try URL-safe base64
@@ -468,6 +655,8 @@ func toProtoEnum(val interface{}) (protoreflect.Value, error) {
 			return protoreflect.Value{}, fmt.Errorf("cannot convert string %q to enum: %w", v, err)
 		}
 		return protoreflect.ValueOfEnum(protoreflect.EnumNumber(i)), nil
+	case []byte:
+		return toProtoEnum(string(v))
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to enum", val)
 	}
