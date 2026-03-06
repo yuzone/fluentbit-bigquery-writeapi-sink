@@ -59,9 +59,9 @@ func TestMapToBinary_StringFields(t *testing.T) {
 	md := buildMD(t, schema)
 
 	tests := []struct {
-		name     string
-		data     map[string]interface{}
-		checkFn  func(t *testing.T, msg *dynamicpb.Message)
+		name    string
+		data    map[string]interface{}
+		checkFn func(t *testing.T, msg *dynamicpb.Message)
 	}{
 		{
 			name: "string value",
@@ -645,6 +645,402 @@ func BenchmarkMapToBinary(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_, err := mapToBinary(md, data, cache)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// helper: rawMapToBinary then unmarshal back to dynamicpb.Message for assertions.
+func rawRoundTrip(t *testing.T, md protoreflect.MessageDescriptor, data map[interface{}]interface{}) *dynamicpb.Message {
+	t.Helper()
+	cache := buildFieldLookupCache(md)
+	b, err := rawMapToBinary(md, data, cache)
+	require.NoError(t, err)
+	msg := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b, msg))
+	return msg
+}
+
+// TestRawMapToBinary_StringFieldsWithBytes tests STRING fields where values
+// arrive as []byte (typical msgpack behavior from Fluent Bit).
+func TestRawMapToBinary_StringFieldsWithBytes(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "Name", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "Tag", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+	md := buildMD(t, schema)
+
+	tests := []struct {
+		name    string
+		data    map[interface{}]interface{}
+		checkFn func(t *testing.T, msg *dynamicpb.Message)
+	}{
+		{
+			name: "[]byte values converted to string",
+			data: map[interface{}]interface{}{"Name": []byte("hello"), "Tag": []byte("world")},
+			checkFn: func(t *testing.T, msg *dynamicpb.Message) {
+				assert.Equal(t, "hello", msg.Get(md.Fields().ByName("Name")).String())
+				assert.Equal(t, "world", msg.Get(md.Fields().ByName("Tag")).String())
+			},
+		},
+		{
+			name: "string values passed through",
+			data: map[interface{}]interface{}{"Name": "hello"},
+			checkFn: func(t *testing.T, msg *dynamicpb.Message) {
+				assert.Equal(t, "hello", msg.Get(md.Fields().ByName("Name")).String())
+			},
+		},
+		{
+			name: "nil value skipped",
+			data: map[interface{}]interface{}{"Name": []byte("hello"), "Tag": nil},
+			checkFn: func(t *testing.T, msg *dynamicpb.Message) {
+				assert.Equal(t, "hello", msg.Get(md.Fields().ByName("Name")).String())
+				assert.Equal(t, "", msg.Get(md.Fields().ByName("Tag")).String())
+			},
+		},
+		{
+			name: "unknown field ignored",
+			data: map[interface{}]interface{}{"Name": []byte("hello"), "Unknown": []byte("ignored")},
+			checkFn: func(t *testing.T, msg *dynamicpb.Message) {
+				assert.Equal(t, "hello", msg.Get(md.Fields().ByName("Name")).String())
+			},
+		},
+		{
+			name: "int coerced to string",
+			data: map[interface{}]interface{}{"Name": 42},
+			checkFn: func(t *testing.T, msg *dynamicpb.Message) {
+				assert.Equal(t, "42", msg.Get(md.Fields().ByName("Name")).String())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := rawRoundTrip(t, md, tt.data)
+			tt.checkFn(t, msg)
+		})
+	}
+}
+
+// TestRawMapToBinary_Int64WithBytes tests that []byte values (msgpack strings)
+// are correctly parsed into int64 proto fields.
+func TestRawMapToBinary_Int64WithBytes(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "count", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+	md := buildMD(t, schema)
+
+	tests := []struct {
+		name     string
+		data     map[interface{}]interface{}
+		expected int64
+	}{
+		{"int64", map[interface{}]interface{}{"count": int64(100)}, 100},
+		{"uint64", map[interface{}]interface{}{"count": uint64(200)}, 200},
+		{"float64", map[interface{}]interface{}{"count": float64(300)}, 300},
+		{"[]byte", map[interface{}]interface{}{"count": []byte("500")}, 500},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := rawRoundTrip(t, md, tt.data)
+			assert.Equal(t, tt.expected, msg.Get(md.Fields().ByName("count")).Int())
+		})
+	}
+}
+
+// TestRawMapToBinary_NestedRawMap tests STRUCT fields where the nested value
+// is a map[interface{}]interface{} (raw msgpack).
+func TestRawMapToBinary_NestedRawMap(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "name", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{
+				Name: "address",
+				Type: storagepb.TableFieldSchema_STRUCT,
+				Mode: storagepb.TableFieldSchema_NULLABLE,
+				Fields: []*storagepb.TableFieldSchema{
+					{Name: "city", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+					{Name: "zip", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+				},
+			},
+		},
+	}
+	md := buildMD(t, schema)
+
+	data := map[interface{}]interface{}{
+		"name": []byte("Alice"),
+		"address": map[interface{}]interface{}{
+			"city": []byte("Tokyo"),
+			"zip":  []byte("100-0001"),
+		},
+	}
+
+	msg := rawRoundTrip(t, md, data)
+	assert.Equal(t, "Alice", msg.Get(md.Fields().ByName("name")).String())
+
+	addrFD := md.Fields().ByName("address")
+	require.NotNil(t, addrFD)
+	addrMsg := msg.Get(addrFD).Message()
+	addrMD := addrFD.Message()
+	assert.Equal(t, "Tokyo", addrMsg.Get(addrMD.Fields().ByName("city")).String())
+	assert.Equal(t, "100-0001", addrMsg.Get(addrMD.Fields().ByName("zip")).String())
+}
+
+// TestRawMapToBinary_RepeatedScalar tests REPEATED fields from raw maps.
+func TestRawMapToBinary_RepeatedScalar(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "tags", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_REPEATED},
+		},
+	}
+	md := buildMD(t, schema)
+
+	data := map[interface{}]interface{}{
+		"tags": []interface{}{[]byte("alpha"), []byte("beta"), "gamma"},
+	}
+
+	msg := rawRoundTrip(t, md, data)
+	tagsFD := md.Fields().ByName("tags")
+	list := msg.Get(tagsFD).List()
+	require.Equal(t, 3, list.Len())
+	assert.Equal(t, "alpha", list.Get(0).String())
+	assert.Equal(t, "beta", list.Get(1).String())
+	assert.Equal(t, "gamma", list.Get(2).String())
+}
+
+// TestRawMapToBinary_RepeatedMessage tests REPEATED STRUCT fields from raw maps.
+func TestRawMapToBinary_RepeatedMessage(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{
+				Name: "items",
+				Type: storagepb.TableFieldSchema_STRUCT,
+				Mode: storagepb.TableFieldSchema_REPEATED,
+				Fields: []*storagepb.TableFieldSchema{
+					{Name: "key", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+					{Name: "value", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+				},
+			},
+		},
+	}
+	md := buildMD(t, schema)
+
+	data := map[interface{}]interface{}{
+		"items": []interface{}{
+			map[interface{}]interface{}{"key": []byte("a"), "value": int64(1)},
+			map[interface{}]interface{}{"key": []byte("b"), "value": int64(2)},
+		},
+	}
+
+	msg := rawRoundTrip(t, md, data)
+	itemsFD := md.Fields().ByName("items")
+	list := msg.Get(itemsFD).List()
+	require.Equal(t, 2, list.Len())
+
+	itemMD := itemsFD.Message()
+	item0 := list.Get(0).Message()
+	assert.Equal(t, "a", item0.Get(itemMD.Fields().ByName("key")).String())
+	assert.Equal(t, int64(1), item0.Get(itemMD.Fields().ByName("value")).Int())
+
+	item1 := list.Get(1).Message()
+	assert.Equal(t, "b", item1.Get(itemMD.Fields().ByName("key")).String())
+	assert.Equal(t, int64(2), item1.Get(itemMD.Fields().ByName("value")).Int())
+}
+
+// TestRawMapToBinary_MatchesMapToBinary verifies that rawMapToBinary produces
+// identical output to mapToBinary for the same logical data.
+func TestRawMapToBinary_MatchesMapToBinary(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "Text", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "Time", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+	md := buildMD(t, schema)
+	cache := buildFieldLookupCache(md)
+
+	// Same data in both formats ([]byte values in raw, string values in parsed)
+	rawData := map[interface{}]interface{}{
+		"Text": []byte("FOO"),
+		"Time": []byte("000"),
+	}
+	parsedData := map[string]interface{}{
+		"Text": "FOO",
+		"Time": "000",
+	}
+
+	rawBytes, err := rawMapToBinary(md, rawData, cache)
+	require.NoError(t, err)
+	parsedBytes, err := mapToBinary(md, parsedData, cache)
+	require.NoError(t, err)
+
+	assert.Equal(t, parsedBytes, rawBytes)
+}
+
+// TestRawMapToBinary_BoolWithBytes tests []byte to bool conversion.
+func TestRawMapToBinary_BoolWithBytes(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "active", Type: storagepb.TableFieldSchema_BOOL, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+	md := buildMD(t, schema)
+
+	tests := []struct {
+		name     string
+		data     map[interface{}]interface{}
+		expected bool
+	}{
+		{"[]byte_true", map[interface{}]interface{}{"active": []byte("true")}, true},
+		{"[]byte_false", map[interface{}]interface{}{"active": []byte("false")}, false},
+		{"[]byte_1", map[interface{}]interface{}{"active": []byte("1")}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := rawRoundTrip(t, md, tt.data)
+			assert.Equal(t, tt.expected, msg.Get(md.Fields().ByName("active")).Bool())
+		})
+	}
+}
+
+// TestRawMapToBinary_DoubleWithBytes tests []byte to float64 conversion.
+func TestRawMapToBinary_DoubleWithBytes(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "score", Type: storagepb.TableFieldSchema_DOUBLE, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+	md := buildMD(t, schema)
+
+	data := map[interface{}]interface{}{"score": []byte("3.14")}
+	msg := rawRoundTrip(t, md, data)
+	assert.InDelta(t, 3.14, msg.Get(md.Fields().ByName("score")).Float(), 0.001)
+}
+
+// TestMessagePoolReuse verifies that pooled messages produce correct output
+// across multiple sequential calls (no stale field leaks after reset).
+func TestMessagePoolReuse(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "name", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "count", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+	md := buildMD(t, schema)
+	cache := buildFieldLookupCache(md)
+
+	// Call mapToBinary multiple times; the pool should reuse messages
+	for i := 0; i < 100; i++ {
+		data := map[string]interface{}{
+			"name":  "user",
+			"count": int64(i),
+		}
+		b, err := mapToBinary(md, data, cache)
+		require.NoError(t, err)
+
+		msg := dynamicpb.NewMessage(md)
+		require.NoError(t, proto.Unmarshal(b, msg))
+		assert.Equal(t, "user", msg.Get(md.Fields().ByName("name")).String())
+		assert.Equal(t, int64(i), msg.Get(md.Fields().ByName("count")).Int())
+	}
+}
+
+// TestMessagePoolReuse_NoStaleFields verifies that fields set in a previous
+// row don't leak into the next row after pool reuse.
+func TestMessagePoolReuse_NoStaleFields(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "a", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "b", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+	md := buildMD(t, schema)
+	cache := buildFieldLookupCache(md)
+
+	// First call sets both fields
+	b1, err := mapToBinary(md, map[string]interface{}{"a": "hello", "b": "world"}, cache)
+	require.NoError(t, err)
+	msg1 := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b1, msg1))
+	assert.Equal(t, "hello", msg1.Get(md.Fields().ByName("a")).String())
+	assert.Equal(t, "world", msg1.Get(md.Fields().ByName("b")).String())
+
+	// Second call sets only "a" — field "b" must NOT carry over from the first call
+	b2, err := mapToBinary(md, map[string]interface{}{"a": "only-a"}, cache)
+	require.NoError(t, err)
+	msg2 := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b2, msg2))
+	assert.Equal(t, "only-a", msg2.Get(md.Fields().ByName("a")).String())
+	assert.Equal(t, "", msg2.Get(md.Fields().ByName("b")).String()) // must be default, not "world"
+}
+
+// TestMessagePoolReuse_RawPath verifies pool reuse via rawMapToBinary.
+func TestMessagePoolReuse_RawPath(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "x", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "y", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+	md := buildMD(t, schema)
+	cache := buildFieldLookupCache(md)
+
+	// First call sets both fields
+	b1, err := rawMapToBinary(md, map[interface{}]interface{}{"x": []byte("first"), "y": int64(1)}, cache)
+	require.NoError(t, err)
+	msg1 := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b1, msg1))
+	assert.Equal(t, "first", msg1.Get(md.Fields().ByName("x")).String())
+	assert.Equal(t, int64(1), msg1.Get(md.Fields().ByName("y")).Int())
+
+	// Second call sets only "x" — field "y" must not carry over
+	b2, err := rawMapToBinary(md, map[interface{}]interface{}{"x": []byte("second")}, cache)
+	require.NoError(t, err)
+	msg2 := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b2, msg2))
+	assert.Equal(t, "second", msg2.Get(md.Fields().ByName("x")).String())
+	assert.Equal(t, int64(0), msg2.Get(md.Fields().ByName("y")).Int()) // must be default
+}
+
+// BenchmarkRawMapToBinary benchmarks the raw map[interface{}]interface{} path.
+func BenchmarkRawMapToBinary(b *testing.B) {
+	schema := mangleInputSchema(&storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "name", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "age", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "score", Type: storagepb.TableFieldSchema_DOUBLE, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "active", Type: storagepb.TableFieldSchema_BOOL, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "ts", Type: storagepb.TableFieldSchema_TIMESTAMP, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "numeric_val", Type: storagepb.TableFieldSchema_NUMERIC, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "tags", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_REPEATED},
+		},
+	}, true)
+	descriptor, _ := adapt.StorageSchemaToProto2Descriptor(schema, "root")
+	md := descriptor.(protoreflect.MessageDescriptor)
+	cache := buildFieldLookupCache(md)
+
+	// Raw data as it would come from Fluent Bit's msgpack decoder
+	data := map[interface{}]interface{}{
+		"name":        []byte("test-user"),
+		"age":         int64(30),
+		"score":       95.5,
+		"active":      true,
+		"ts":          int64(1700000000000000),
+		"numeric_val": []byte("123.456789"),
+		"tags":        []interface{}{[]byte("tag1"), []byte("tag2"), []byte("tag3")},
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := rawMapToBinary(md, data, cache)
 		if err != nil {
 			b.Fatal(err)
 		}

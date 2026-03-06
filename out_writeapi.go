@@ -184,91 +184,57 @@ func getDescriptors(curr_ctx context.Context, mw_client ManagedWriterClient, pro
 	return messageDescriptor, dp, timestampFields, nil
 }
 
-// This function handles the data transformation from a Go map to binary for a single row.
-// It populates the proto message directly from the map, bypassing the intermediate
-// JSON serialization (json.Marshal + protojson.Unmarshal) for better performance.
-// The outputs of this function are the corresponding binary data as well as any error that occur.
-func jsonToBinary(message_descriptor protoreflect.MessageDescriptor, jsonRow map[string]interface{}, cache fieldLookupCache) ([]byte, error) {
-	return mapToBinary(message_descriptor, jsonRow, cache)
-}
-
-// From https://github.com/majst01/fluent-bit-go-redis-output.git
-// Function is used to transform fluent-bit record to a JSON map
-func parseMap(mapInterface map[interface{}]interface{}) map[string]interface{} {
-	if mapInterface == nil {
-		return nil
-	}
-	m := make(map[string]interface{})
-	for k, v := range mapInterface {
-		switch t := v.(type) {
-		case []byte:
-			// Prevent encoding to base64
-			m[k.(string)] = string(t)
-		case map[interface{}]interface{}:
-			m[k.(string)] = parseMap(t)
-		case []interface{}:
-			m[k.(string)] = parseSlice(t)
-		default:
-			m[k.(string)] = v
-		}
-	}
-	return m
-}
-
-// Function to handle slices that may contain nested maps
-func parseSlice(sliceInterface []interface{}) []interface{} {
-	if sliceInterface == nil {
-		return nil
-	}
-	result := make([]interface{}, len(sliceInterface))
-	for i, v := range sliceInterface {
-		switch t := v.(type) {
-		case []byte:
-			result[i] = string(t)
-		case map[interface{}]interface{}:
-			result[i] = parseMap(t)
-		case []interface{}:
-			result[i] = parseSlice(t)
-		default:
-			result[i] = v
-		}
-	}
-	return result
-}
-
-// Convert timestamp fields from seconds to microseconds for BigQuery Storage Write API
-// BigQuery TIMESTAMP type expects microseconds since Unix epoch
-func convertTimestampFields(data map[string]interface{}, timestampFields []string) {
+// convertTimestampFieldsRaw converts timestamp fields in a raw Fluent Bit record
+// (map[interface{}]interface{}) from seconds to microseconds for BigQuery Storage Write API.
+// BigQuery TIMESTAMP type expects microseconds since Unix epoch.
+func convertTimestampFieldsRaw(data map[interface{}]interface{}, timestampFields []string) {
 	for _, field := range timestampFields {
+		// In Go, map[interface{}]interface{} lookup with a string key works
+		// because interface comparison uses underlying type+value equality.
 		if val, ok := data[field]; ok {
-			switch v := val.(type) {
-			case int64:
-				// If value looks like seconds (less than year 2100 in seconds), convert to microseconds
-				if v > 0 && v < maxUnixSeconds {
-					data[field] = v * 1000000
+			convertTimestampValueRaw(data, field, val)
+		}
+	}
+}
+
+// convertTimestampValueRaw handles the value conversion for map[interface{}]interface{}
+func convertTimestampValueRaw(data map[interface{}]interface{}, field string, val interface{}) {
+	switch v := val.(type) {
+	case int64:
+		if v > 0 && v < maxUnixSeconds {
+			data[field] = v * 1000000
+		}
+	case int:
+		if v > 0 && v < maxUnixSeconds {
+			data[field] = int64(v) * 1000000
+		}
+	case uint64:
+		if v > 0 && v < maxUnixSeconds {
+			data[field] = int64(v) * 1000000
+		}
+	case float64:
+		if v > 0 && v < maxUnixSeconds {
+			data[field] = int64(v * 1000000)
+		}
+	case string:
+		if v != "" {
+			if floatVal, err := strconv.ParseFloat(v, 64); err == nil {
+				if floatVal > 0 && floatVal < maxUnixSeconds {
+					data[field] = int64(floatVal * 1000000)
+				} else {
+					data[field] = int64(floatVal)
 				}
-			case int:
-				if v > 0 && v < maxUnixSeconds {
-					data[field] = int64(v) * 1000000
-				}
-			case uint64:
-				if v > 0 && v < maxUnixSeconds {
-					data[field] = int64(v) * 1000000
-				}
-			case float64:
-				if v > 0 && v < maxUnixSeconds {
-					data[field] = int64(v * 1000000)
-				}
-			case string:
-				// Handle string timestamp (e.g., "1769419316")
-				if v != "" {
-					if floatVal, err := strconv.ParseFloat(v, 64); err == nil {
-						if floatVal > 0 && floatVal < maxUnixSeconds {
-							data[field] = int64(floatVal * 1000000)
-						} else {
-							data[field] = int64(floatVal)
-						}
-					}
+			}
+		}
+	case []byte:
+		// Handle msgpack string values that arrive as []byte
+		s := string(v)
+		if s != "" {
+			if floatVal, err := strconv.ParseFloat(s, 64); err == nil {
+				if floatVal > 0 && floatVal < maxUnixSeconds {
+					data[field] = int64(floatVal * 1000000)
+				} else {
+					data[field] = int64(floatVal)
 				}
 			}
 		}
@@ -806,16 +772,13 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 			break
 		}
 
-		rowJSONMap := parseMap(record)
+		// Convert timestamp fields in-place on the raw record
+		convertTimestampFieldsRaw(record, config.timestampFields)
 
-		// Convert timestamp fields from seconds to microseconds for BigQuery Storage Write API
-		convertTimestampFields(rowJSONMap, config.timestampFields)
-
-		// Serialize data
-		// Transform each row of data into binary using the jsonToBinary function and the message descriptor from the getDescriptors function
-		buf, err := jsonToBinary(config.messageDescriptor, rowJSONMap, config.fieldCache)
+		// Serialize data directly from raw Fluent Bit record
+		buf, err := rawMapToBinary(config.messageDescriptor, record, config.fieldCache)
 		if err != nil {
-			log.Printf("Transforming row with value:%s from JSON to binary data for output instance with id: %d failed in FLBPluginFlushCtx: %s", rowJSONMap, id, err)
+			log.Printf("Transforming row with value:%v from map to binary data for output instance with id: %d failed in FLBPluginFlushCtx: %s", record, id, err)
 		} else {
 			// Successful data transformation
 			if (currsize + len(buf)) >= config.maxChunkSize {

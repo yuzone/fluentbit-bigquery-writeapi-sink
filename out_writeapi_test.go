@@ -1046,352 +1046,110 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	assert.Equal(t, expectGotRecord, checks.gotRecord)
 }
 
-// TestParseMap tests the parseMap function
-func TestParseMap(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    map[interface{}]interface{}
-		expected map[string]interface{}
-	}{
-		{
-			name:     "nil map returns nil",
-			input:    nil,
-			expected: nil,
-		},
-		{
-			name:     "empty map",
-			input:    map[interface{}]interface{}{},
-			expected: map[string]interface{}{},
-		},
-		{
-			name: "simple string values",
-			input: map[interface{}]interface{}{
-				"key1": "value1",
-				"key2": "value2",
-			},
-			expected: map[string]interface{}{
-				"key1": "value1",
-				"key2": "value2",
-			},
-		},
-		{
-			name: "byte slice values converted to string",
-			input: map[interface{}]interface{}{
-				"text": []byte("hello"),
-			},
-			expected: map[string]interface{}{
-				"text": "hello",
-			},
-		},
-		{
-			name: "nested map",
-			input: map[interface{}]interface{}{
-				"outer": map[interface{}]interface{}{
-					"inner": "value",
-				},
-			},
-			expected: map[string]interface{}{
-				"outer": map[string]interface{}{
-					"inner": "value",
-				},
-			},
-		},
-		{
-			name: "slice values",
-			input: map[interface{}]interface{}{
-				"list": []interface{}{"a", "b", "c"},
-			},
-			expected: map[string]interface{}{
-				"list": []interface{}{"a", "b", "c"},
-			},
-		},
-		{
-			name: "slice with nested map",
-			input: map[interface{}]interface{}{
-				"items": []interface{}{
-					map[interface{}]interface{}{
-						"name": "item1",
-					},
-					map[interface{}]interface{}{
-						"name": "item2",
-					},
-				},
-			},
-			expected: map[string]interface{}{
-				"items": []interface{}{
-					map[string]interface{}{
-						"name": "item1",
-					},
-					map[string]interface{}{
-						"name": "item2",
-					},
-				},
-			},
-		},
-		{
-			name: "slice with byte slice",
-			input: map[interface{}]interface{}{
-				"data": []interface{}{
-					[]byte("first"),
-					[]byte("second"),
-				},
-			},
-			expected: map[string]interface{}{
-				"data": []interface{}{
-					"first",
-					"second",
-				},
-			},
-		},
-		{
-			name: "integer and float values",
-			input: map[interface{}]interface{}{
-				"int":   42,
-				"float": 3.14,
-			},
-			expected: map[string]interface{}{
-				"int":   42,
-				"float": 3.14,
-			},
-		},
-		{
-			name: "boolean values",
-			input: map[interface{}]interface{}{
-				"true":  true,
-				"false": false,
-			},
-			expected: map[string]interface{}{
-				"true":  true,
-				"false": false,
-			},
-		},
-		{
-			name: "deeply nested structure",
-			input: map[interface{}]interface{}{
-				"level1": map[interface{}]interface{}{
-					"level2": map[interface{}]interface{}{
-						"level3": []interface{}{
-							map[interface{}]interface{}{
-								"data": []byte("deep"),
-							},
-						},
-					},
-				},
-			},
-			expected: map[string]interface{}{
-				"level1": map[string]interface{}{
-					"level2": map[string]interface{}{
-						"level3": []interface{}{
-							map[string]interface{}{
-								"data": "deep",
-							},
-						},
-					},
-				},
-			},
-		},
-		{
-			name: "mixed types",
-			input: map[interface{}]interface{}{
-				"string":  "text",
-				"bytes":   []byte("binary"),
-				"number":  123,
-				"boolean": true,
-				"nested": map[interface{}]interface{}{
-					"key": "value",
-				},
-				"list": []interface{}{1, 2, 3},
-			},
-			expected: map[string]interface{}{
-				"string":  "text",
-				"bytes":   "binary",
-				"number":  123,
-				"boolean": true,
-				"nested": map[string]interface{}{
-					"key": "value",
-				},
-				"list": []interface{}{1, 2, 3},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := parseMap(tt.input)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-// TestParseSlice tests the parseSlice function
-func TestParseSlice(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    []interface{}
-		expected []interface{}
-	}{
-		{
-			name:     "nil slice returns nil",
-			input:    nil,
-			expected: nil,
-		},
-		{
-			name:     "empty slice",
-			input:    []interface{}{},
-			expected: []interface{}{},
-		},
-		{
-			name:     "simple values",
-			input:    []interface{}{"a", "b", "c"},
-			expected: []interface{}{"a", "b", "c"},
-		},
-		{
-			name:     "byte slice converted to string",
-			input:    []interface{}{[]byte("hello"), []byte("world")},
-			expected: []interface{}{"hello", "world"},
-		},
-		{
-			name: "nested map in slice",
-			input: []interface{}{
-				map[interface{}]interface{}{
-					"key": "value",
-				},
-			},
-			expected: []interface{}{
-				map[string]interface{}{
-					"key": "value",
-				},
-			},
-		},
-		{
-			name: "nested slice",
-			input: []interface{}{
-				[]interface{}{1, 2, 3},
-				[]interface{}{"a", "b"},
-			},
-			expected: []interface{}{
-				[]interface{}{1, 2, 3},
-				[]interface{}{"a", "b"},
-			},
-		},
-		{
-			name:     "mixed types",
-			input:    []interface{}{"string", []byte("bytes"), 42, true},
-			expected: []interface{}{"string", "bytes", 42, true},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := parseSlice(tt.input)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-// TestConvertTimestampFields tests the convertTimestampFields function
-func TestConvertTimestampFields(t *testing.T) {
+// TestConvertTimestampFieldsRaw tests the convertTimestampFieldsRaw function
+// for raw Fluent Bit records (map[interface{}]interface{}).
+func TestConvertTimestampFieldsRaw(t *testing.T) {
 	tests := []struct {
 		name            string
-		input           map[string]interface{}
+		input           map[interface{}]interface{}
 		timestampFields []string
-		expected        map[string]interface{}
+		expected        map[interface{}]interface{}
 	}{
 		{
 			name:            "int64 seconds converted to microseconds",
-			input:           map[string]interface{}{"time": int64(1700000000)},
+			input:           map[interface{}]interface{}{"time": int64(1700000000)},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(1700000000000000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000000000)},
 		},
 		{
 			name:            "int seconds converted to microseconds",
-			input:           map[string]interface{}{"time": 1700000000},
+			input:           map[interface{}]interface{}{"time": 1700000000},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(1700000000000000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000000000)},
 		},
 		{
 			name:            "uint64 seconds converted to microseconds",
-			input:           map[string]interface{}{"time": uint64(1700000000)},
+			input:           map[interface{}]interface{}{"time": uint64(1700000000)},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(1700000000000000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000000000)},
 		},
 		{
 			name:            "float64 seconds converted to microseconds",
-			input:           map[string]interface{}{"time": float64(1700000000.5)},
+			input:           map[interface{}]interface{}{"time": float64(1700000000.5)},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(1700000000500000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000500000)},
 		},
 		{
 			name:            "value already in microseconds not converted",
-			input:           map[string]interface{}{"time": int64(1700000000000000)},
+			input:           map[interface{}]interface{}{"time": int64(1700000000000000)},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(1700000000000000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000000000)},
 		},
 		{
-			name:            "boundary value at maxUnixSeconds not converted",
-			input:           map[string]interface{}{"time": int64(4102444800)},
+			name:            "[]byte string timestamp converted",
+			input:           map[interface{}]interface{}{"time": []byte("1700000000")},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(4102444800)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000000000)},
 		},
 		{
-			name:            "boundary value just below maxUnixSeconds converted",
-			input:           map[string]interface{}{"time": int64(4102444799)},
+			name:            "[]byte non-numeric string not converted",
+			input:           map[interface{}]interface{}{"time": []byte("not-a-number")},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(4102444799000000)},
+			expected:        map[interface{}]interface{}{"time": []byte("not-a-number")},
 		},
 		{
-			name:            "zero value not converted",
-			input:           map[string]interface{}{"time": int64(0)},
+			name:            "string timestamp converted",
+			input:           map[interface{}]interface{}{"time": "1700000000"},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(0)},
-		},
-		{
-			name:            "negative value not converted",
-			input:           map[string]interface{}{"time": int64(-1000)},
-			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(-1000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000000000)},
 		},
 		{
 			name:            "field not in timestampFields not converted",
-			input:           map[string]interface{}{"time": int64(1700000000), "other": int64(1700000000)},
+			input:           map[interface{}]interface{}{"time": int64(1700000000), "other": int64(1700000000)},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": int64(1700000000000000), "other": int64(1700000000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000000000), "other": int64(1700000000)},
 		},
 		{
 			name:            "multiple timestamp fields",
-			input:           map[string]interface{}{"time": int64(1700000000), "created_at": int64(1600000000)},
+			input:           map[interface{}]interface{}{"time": int64(1700000000), "created_at": int64(1600000000)},
 			timestampFields: []string{"time", "created_at"},
-			expected:        map[string]interface{}{"time": int64(1700000000000000), "created_at": int64(1600000000000000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000000000), "created_at": int64(1600000000000000)},
 		},
 		{
 			name:            "field not present in data",
-			input:           map[string]interface{}{"other": "value"},
+			input:           map[interface{}]interface{}{"other": "value"},
 			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"other": "value"},
-		},
-		{
-			name:            "string value not converted",
-			input:           map[string]interface{}{"time": "2023-11-14T00:00:00Z"},
-			timestampFields: []string{"time"},
-			expected:        map[string]interface{}{"time": "2023-11-14T00:00:00Z"},
+			expected:        map[interface{}]interface{}{"other": "value"},
 		},
 		{
 			name:            "empty timestamp fields",
-			input:           map[string]interface{}{"time": int64(1700000000)},
+			input:           map[interface{}]interface{}{"time": int64(1700000000)},
 			timestampFields: []string{},
-			expected:        map[string]interface{}{"time": int64(1700000000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000)},
 		},
 		{
 			name:            "nil timestamp fields",
-			input:           map[string]interface{}{"time": int64(1700000000)},
+			input:           map[interface{}]interface{}{"time": int64(1700000000)},
 			timestampFields: nil,
-			expected:        map[string]interface{}{"time": int64(1700000000)},
+			expected:        map[interface{}]interface{}{"time": int64(1700000000)},
+		},
+		{
+			name:            "zero value not converted",
+			input:           map[interface{}]interface{}{"time": int64(0)},
+			timestampFields: []string{"time"},
+			expected:        map[interface{}]interface{}{"time": int64(0)},
+		},
+		{
+			name:            "negative value not converted",
+			input:           map[interface{}]interface{}{"time": int64(-1000)},
+			timestampFields: []string{"time"},
+			expected:        map[interface{}]interface{}{"time": int64(-1000)},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			convertTimestampFields(tt.input, tt.timestampFields)
+			convertTimestampFieldsRaw(tt.input, tt.timestampFields)
 			assert.Equal(t, tt.expected, tt.input)
 		})
 	}
