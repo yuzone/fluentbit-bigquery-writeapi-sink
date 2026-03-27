@@ -185,6 +185,26 @@ func mapToMessage(md protoreflect.MessageDescriptor, data map[string]interface{}
 	return msg, nil
 }
 
+// toSubMessage converts val (map[string]interface{} or map[interface{}]interface{})
+// into a populated *dynamicpb.Message using a pooled message.
+// It is the single authoritative path for building sub-messages from either the
+// typed (mapToBinary) or raw (rawMapToBinary) Fluent Bit record paths.
+func toSubMessage(val interface{}, md protoreflect.MessageDescriptor, cache fieldLookupCache) (*dynamicpb.Message, error) {
+	switch sub := val.(type) {
+	case map[interface{}]interface{}:
+		subMsg := getPooledMessage(md)
+		if err := rawPopulateMessage(subMsg, md, sub, cache); err != nil {
+			putPooledMessage(subMsg)
+			return nil, err
+		}
+		return subMsg, nil
+	case map[string]interface{}:
+		return mapToMessage(md, sub, cache)
+	default:
+		return nil, fmt.Errorf("expected map for message field, got %T", val)
+	}
+}
+
 // populateMessage fills an existing dynamicpb.Message from a map[string]interface{}.
 // Extracted from mapToMessage so that callers can supply a pooled message
 func populateMessage(msg *dynamicpb.Message, md protoreflect.MessageDescriptor, data map[string]interface{}, cache fieldLookupCache) error {
@@ -215,11 +235,7 @@ func populateMessage(msg *dynamicpb.Message, md protoreflect.MessageDescriptor, 
 				return fmt.Errorf("field %q: %w", key, err)
 			}
 		} else if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
-			subMap, ok := val.(map[string]interface{})
-			if !ok {
-				return fmt.Errorf("field %q: expected map for message field, got %T", key, val)
-			}
-			subMsg, err := mapToMessage(fd.Message(), subMap, cache)
+			subMsg, err := toSubMessage(val, fd.Message(), cache)
 			if err != nil {
 				return fmt.Errorf("field %q: %w", key, err)
 			}
@@ -266,27 +282,15 @@ func rawPopulateMessage(msg *dynamicpb.Message, md protoreflect.MessageDescripto
 		}
 
 		if fd.IsList() {
-			if err := rawSetRepeatedField(msg, fd, val, cache); err != nil {
+			if err := setRepeatedField(msg, fd, val, cache); err != nil {
 				return fmt.Errorf("field %q: %w", key, err)
 			}
 		} else if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
-			switch sub := val.(type) {
-			case map[interface{}]interface{}:
-				subMsg := getPooledMessage(fd.Message())
-				if err := rawPopulateMessage(subMsg, fd.Message(), sub, cache); err != nil {
-					putPooledMessage(subMsg)
-					return fmt.Errorf("field %q: %w", key, err)
-				}
-				msg.Set(fd, protoreflect.ValueOfMessage(subMsg))
-			case map[string]interface{}:
-				subMsg, err := mapToMessage(fd.Message(), sub, cache)
-				if err != nil {
-					return fmt.Errorf("field %q: %w", key, err)
-				}
-				msg.Set(fd, protoreflect.ValueOfMessage(subMsg))
-			default:
-				return fmt.Errorf("field %q: expected map for message field, got %T", key, val)
+			subMsg, err := toSubMessage(val, fd.Message(), cache)
+			if err != nil {
+				return fmt.Errorf("field %q: %w", key, err)
 			}
+			msg.Set(fd, protoreflect.ValueOfMessage(subMsg))
 		} else {
 			pv, err := goToProtoScalar(fd, val)
 			if err != nil {
@@ -335,60 +339,11 @@ func setRepeatedField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, v
 			continue
 		}
 		if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
-			subMap, ok := item.(map[string]interface{})
-			if !ok {
-				return fmt.Errorf("element %d: expected map for repeated message, got %T", i, item)
-			}
-			subMsg, err := mapToMessage(fd.Message(), subMap, cache)
+			subMsg, err := toSubMessage(item, fd.Message(), cache)
 			if err != nil {
 				return fmt.Errorf("element %d: %w", i, err)
 			}
 			list.Append(protoreflect.ValueOfMessage(subMsg))
-		} else {
-			pv, err := goToProtoScalar(fd, item)
-			if err != nil {
-				return fmt.Errorf("element %d: %w", i, err)
-			}
-			list.Append(pv)
-		}
-	}
-	return nil
-}
-
-// rawSetRepeatedField populates a repeated proto field from a raw slice,
-// handling map[interface{}]interface{} elements for nested messages
-func rawSetRepeatedField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor, val interface{}, cache fieldLookupCache) error {
-	slice, ok := val.([]interface{})
-	if !ok {
-		return fmt.Errorf("expected []interface{} for repeated field, got %T", val)
-	}
-	if len(slice) == 0 {
-		return nil
-	}
-
-	list := msg.Mutable(fd).List()
-	for i, item := range slice {
-		if item == nil {
-			continue
-		}
-		if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
-			switch sub := item.(type) {
-			case map[interface{}]interface{}:
-				subMsg := getPooledMessage(fd.Message())
-				if err := rawPopulateMessage(subMsg, fd.Message(), sub, cache); err != nil {
-					putPooledMessage(subMsg)
-					return fmt.Errorf("element %d: %w", i, err)
-				}
-				list.Append(protoreflect.ValueOfMessage(subMsg))
-			case map[string]interface{}:
-				subMsg, err := mapToMessage(fd.Message(), sub, cache)
-				if err != nil {
-					return fmt.Errorf("element %d: %w", i, err)
-				}
-				list.Append(protoreflect.ValueOfMessage(subMsg))
-			default:
-				return fmt.Errorf("element %d: expected map for repeated message, got %T", i, item)
-			}
 		} else {
 			pv, err := goToProtoScalar(fd, item)
 			if err != nil {
