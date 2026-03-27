@@ -23,13 +23,13 @@ jobs:
       run: go build -buildmode=c-shared -o out_writeapi.so
 
     - name: Run tests
-      run: go test -v -gcflags=all=-l -skip "^Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandlingExactlyOnce|DefaultValue)$"
+      run: go test -v -skip "^Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandlingExactlyOnce|DefaultValue)$"
 
     - name: Run integration tests
       # Integration tests require GCP credentials
       if: ${{ env.GCP_PROJECT_ID != '' }}
       run: |
-        go test -v -gcflags=all=-l -run "Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandlingExactlyOnce|DefaultValue)"
+        go test -v -run "Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandlingExactlyOnce|DefaultValue)"
       env:
         ProjectID: ${{ secrets.GCP_PROJECT_ID }}
         DatasetID: ${{ secrets.GCP_DATASET_ID }}
