@@ -58,7 +58,7 @@ type outputConfig struct {
 	managedStreamSlice    *[]*streamConfig
 	client                ManagedWriterClient
 	maxChunkSize          int
-	mutex                 sync.Mutex
+	streamMu              sync.Mutex // guards managedStreamSlice and its elements (streamConfig)
 	exactlyOnce           bool
 	requestCountThreshold int
 	numRetries            int
@@ -381,11 +381,11 @@ func rebuildPredicate(err error) bool {
 }
 
 // This function sends and checks the responses for data through a committed stream with exactly once functionality.
-// On success the stream's offsetCounter is incremented by len(data) within the same mutex critical section
+// On success the stream's offsetCounter is incremented by len(data) within the same streamMu critical section
 // as the append, preventing TOCTOU races when workers > 1.
 func sendRequestExactlyOnce(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
-	config.mutex.Lock()
-	defer config.mutex.Unlock()
+	config.streamMu.Lock()
+	defer config.streamMu.Unlock()
 
 	currStream := (*config.managedStreamSlice)[streamIndex]
 
@@ -404,7 +404,7 @@ func sendRequestExactlyOnce(ctx context.Context, data [][]byte, config *outputCo
 }
 
 // This function enables synchronous retries and rebuilding a valid stream based on the server response.
-// The mutex is held while closing and rebuilding the stream (rebuildPredicate path) so that no other
+// The streamMu is held while closing and rebuilding the stream (rebuildPredicate path) so that no other
 // worker (workers > 1 scenario) can use the stream concurrently during the teardown/rebuild.
 // Note: this means network I/O (Finalize, Close, buildStream) runs under the lock on that path,
 // which is a known trade-off; see issue #12 in docs/code-analysis.md.
@@ -418,15 +418,15 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig
 		}
 		// Unsuccessful data append
 		if rebuildPredicate(err) {
-			// Hold the mutex while closing and rebuilding the stream so no concurrent
+			// Hold streamMu while closing and rebuilding the stream so no concurrent
 			// worker (workers > 1) can observe a partially-closed or replaced stream.
-			config.mutex.Lock()
+			config.streamMu.Lock()
 			currStream := (*config.managedStreamSlice)[streamIndex]
 			currStream.managedstream.Finalize(ctx)
 			currStream.managedstream.Close()
 			// Rebuild stream
 			buildErr := buildStream(ctx, config, streamIndex)
-			config.mutex.Unlock()
+			config.streamMu.Unlock()
 			if buildErr != nil {
 				return buildErr
 			}
@@ -447,8 +447,8 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig
 
 // This function sends data and appends the responses to a queue to be checked asynchronously through a default stream with at least once functionality
 func sendRequestDefault(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
-	config.mutex.Lock()
-	defer config.mutex.Unlock()
+	config.streamMu.Lock()
+	defer config.streamMu.Unlock()
 	currStream := (*config.managedStreamSlice)[streamIndex]
 
 	appendResult, err := currStream.managedstream.AppendRows(ctx, data)
@@ -509,8 +509,8 @@ var setThreshold = func(maxQueueSize int) int {
 // This function check whether there is room for scaling and the scales the number of stream dynamically depending on if it
 // Detects back pressure from the queue
 func createNewStreamDynamicScaling(ctx context.Context, config *outputConfig) {
-	config.mutex.Lock()
-	defer config.mutex.Unlock()
+	config.streamMu.Lock()
+	defer config.streamMu.Unlock()
 	if len(*config.managedStreamSlice) < maxNumStreamsPerInstance {
 		// Gets stream with least values in queue
 		mostEfficient := getLeastLoadedStream(config.managedStreamSlice)
@@ -610,8 +610,8 @@ var getFLBPluginContext = func(ctx unsafe.Pointer) int {
 
 // Finalizes and Closes all streams in slice for a given instance
 func finalizeCloseAllStreams(config *outputConfig, id int) bool {
-	config.mutex.Lock()
-	defer config.mutex.Unlock()
+	config.streamMu.Lock()
+	defer config.streamMu.Unlock()
 	errFlag := false
 	streamSlice := config.managedStreamSlice
 	for i := 0; i < len(*config.managedStreamSlice); i++ {
@@ -779,12 +779,12 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 
 // flushChunk picks the least-loaded stream and sends binaryData.
 // For exactly-once mode the stream's offsetCounter is incremented by len(binaryData)
-// inside sendRequestExactlyOnce within the same mutex critical section as the
+// inside sendRequestExactlyOnce within the same streamMu critical section as the
 // AppendRows call, preventing TOCTOU races when workers > 1.
 func flushChunk(ctx context.Context, config *outputConfig, id int, binaryData [][]byte) {
-	config.mutex.Lock()
+	config.streamMu.Lock()
 	streamIndex := getLeastLoadedStream(config.managedStreamSlice)
-	config.mutex.Unlock()
+	config.streamMu.Unlock()
 
 	if err := sendRequest(ctx, binaryData, config, streamIndex); err != nil {
 		log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
@@ -843,7 +843,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	defer flushCancel()
 
 	// Drain ready responses and check whether a new stream should be created.
-	checkAllStreamResponses(flushCtx, &config.managedStreamSlice, false, &config.mutex, config.exactlyOnce, id)
+	checkAllStreamResponses(flushCtx, &config.managedStreamSlice, false, &config.streamMu, config.exactlyOnce, id)
 	createNewStreamDynamicScaling(flushCtx, config)
 
 	// binaryData is a flush-local buffer. Each worker (workers > 1) gets its own
@@ -879,7 +879,7 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 
 	// Drain all pending responses before closing streams to avoid data loss.
 	// waitForResponse=true blocks until every in-flight AppendRows result is received.
-	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, true, &config.mutex, config.exactlyOnce, id)
+	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, true, &config.streamMu, config.exactlyOnce, id)
 	errFlag := finalizeCloseAllStreams(config, id)
 
 	if config.client != nil {
