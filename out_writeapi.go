@@ -68,7 +68,6 @@ type outputConfig struct {
 }
 
 var (
-	ms_ctx    = context.Background()
 	configMap = make(map[int]*outputConfig)
 	configID  atomic.Int64
 )
@@ -609,7 +608,7 @@ var getFLBPluginContext = func(ctx unsafe.Pointer) int {
 }
 
 // Finalizes and Closes all streams in slice for a given instance
-func finalizeCloseAllStreams(config *outputConfig, id int) bool {
+func finalizeCloseAllStreams(ctx context.Context, config *outputConfig, id int) bool {
 	config.streamMu.Lock()
 	defer config.streamMu.Unlock()
 	errFlag := false
@@ -617,7 +616,7 @@ func finalizeCloseAllStreams(config *outputConfig, id int) bool {
 	for i := 0; i < len(*config.managedStreamSlice); i++ {
 		if (*streamSlice)[i].managedstream != nil {
 			if config.exactlyOnce {
-				if _, err := (*streamSlice)[i].managedstream.Finalize(ms_ctx); err != nil {
+				if _, err := (*streamSlice)[i].managedstream.Finalize(ctx); err != nil {
 					log.Printf("Finalizing managed stream for output instance with id %d and stream index %d failed in FLBPluginExit: %s", id, i, err)
 					errFlag = true
 				}
@@ -697,7 +696,8 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	}
 
 	// Create new client
-	client, err := getClient(ms_ctx, projectID)
+	initCtx := context.Background()
+	client, err := getClient(initCtx, projectID)
 	if err != nil {
 		log.Printf("Creating a new managed BigQuery Storage write client scoped to: %s failed in FLBPluginInit: %s", projectID, err)
 		return output.FLB_ERROR
@@ -707,7 +707,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	tableReference := fmt.Sprintf("projects/%s/datasets/%s/tables/%s", projectID, datasetID, tableID)
 
 	// Call getDescriptors to get the message descriptor, and descriptor proto
-	md, descriptor, timestampFields, err := getDescriptors(ms_ctx, client, projectID, datasetID, tableID, dateTimeStringType)
+	md, descriptor, timestampFields, err := getDescriptors(initCtx, client, projectID, datasetID, tableID, dateTimeStringType)
 	if err != nil {
 		log.Printf("Getting message descriptor and descriptor proto for table: %s failed in FLBPluginInit: %s", tableReference, err)
 		return output.FLB_ERROR
@@ -756,7 +756,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	}
 
 	// Create stream using NewManagedStream
-	err = buildStream(ms_ctx, &config, 0)
+	err = buildStream(initCtx, &config, 0)
 	if err != nil {
 		log.Printf("Creating a new managed stream with destination table: %s failed in FLBPluginInit: %s", tableReference, err)
 		return output.FLB_ERROR
@@ -879,8 +879,11 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 
 	// Drain all pending responses before closing streams to avoid data loss.
 	// waitForResponse=true blocks until every in-flight AppendRows result is received.
-	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, true, &config.streamMu, config.exactlyOnce, id)
-	errFlag := finalizeCloseAllStreams(config, id)
+	// Use a timeout context (same duration as flush) so exit cannot hang indefinitely.
+	exitCtx, exitCancel := context.WithTimeout(context.Background(), config.flushTimeout)
+	defer exitCancel()
+	checkAllStreamResponses(exitCtx, &config.managedStreamSlice, true, &config.streamMu, config.exactlyOnce, id)
+	errFlag := finalizeCloseAllStreams(exitCtx, config, id)
 
 	if config.client != nil {
 		if err := config.client.Close(); err != nil {
