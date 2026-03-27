@@ -491,8 +491,14 @@ func getLeastLoadedStream(streamSlice *[]*streamConfig) int {
 
 // This is a test-only method which takes in a config id and returns the current offset value of the struct corresponding to the id
 func getOffset(id int) int64 {
-	config := configMap[id]
+	config, ok := configMap[id]
+	if !ok || config == nil {
+		return 0
+	}
 	streamSlice := *config.managedStreamSlice
+	if len(streamSlice) == 0 {
+		return 0
+	}
 	return streamSlice[0].offsetCounter
 }
 
