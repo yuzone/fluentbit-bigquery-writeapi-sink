@@ -98,6 +98,9 @@ func (m *MockManagedWriterClient) GetWriteStream(ctx context.Context, req *stora
 }
 
 func (m *MockManagedWriterClient) Close() error {
+	if m.CloseFunc != nil {
+		return m.CloseFunc()
+	}
 	return m.client.Close()
 }
 
@@ -327,6 +330,9 @@ func (m *MockManagedStream) StreamName() string {
 }
 
 func (m *MockManagedStream) Close() error {
+	if m.CloseFunc != nil {
+		return m.CloseFunc()
+	}
 	return m.managedstream.Close()
 }
 
@@ -1048,6 +1054,120 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	assert.Equal(t, 2, checks.getResultsCount)
 	assert.Equal(t, 2, checks.createDecoder)
 	assert.Equal(t, expectGotRecord, checks.gotRecord)
+}
+
+// TestFLBPluginExitCtxDrainsPendingResponses verifies that FLBPluginExitCtx
+// drains all pending (not-yet-ready) AppendRows responses before closing streams.
+func TestFLBPluginExitCtxDrainsPendingResponses(t *testing.T) {
+	var setID int
+
+	testTableSchema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "Text", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+
+	mockClient := &MockManagedWriterClient{
+		NewManagedStreamFunc: func(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error) {
+			return nil, nil
+		},
+		GetWriteStreamFunc: func(ctx context.Context, req *storagepb.GetWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error) {
+			return &storagepb.WriteStream{Name: "mockstream", TableSchema: testTableSchema}, nil
+		},
+		CloseFunc: func() error { return nil },
+	}
+
+	originalGetClient := getClient
+	getClient = func(ctx context.Context, projectID string) (ManagedWriterClient, error) {
+		return mockClient, nil
+	}
+	defer func() { getClient = originalGetClient }()
+
+	var appendRowsCalled int
+	mockMS := &MockManagedStream{
+		AppendRowsFunc: func(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error) {
+			appendRowsCalled++
+			return nil, nil // nil AppendResult queued; drained via mocked pluginGetResult
+		},
+		CloseFunc: func() error { return nil },
+		FinalizeFunc: func(ctx context.Context, opts ...gax.CallOption) (int64, error) {
+			return 0, nil
+		},
+		FlushRowsFunc: func(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error) {
+			return 0, nil
+		},
+		StreamNameFunc: func() string { return "" },
+	}
+
+	origGetWriter := getWriter
+	getWriter = func(client ManagedWriterClient, ctx context.Context, projectID string, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
+		return mockMS, nil
+	}
+	defer func() { getWriter = origGetWriter }()
+
+	patch1 := gomonkey.ApplyFunc(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+		return ""
+	})
+	defer patch1.Reset()
+
+	patchSetContext := gomonkey.ApplyFunc(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+		setID = ctx.(int)
+	})
+	defer patchSetContext.Reset()
+
+	initRes := FLBPluginInit(nil)
+	assert.Equal(t, output.FLB_OK, initRes)
+
+	origGetContext := getFLBPluginContext
+	getFLBPluginContext = func(ctx unsafe.Pointer) int {
+		if ctx != nil {
+			return *(*int)(ctx)
+		}
+		return 0
+	}
+	defer func() { getFLBPluginContext = origGetContext }()
+
+	// isReady always returns false — responses are "in-flight" and not yet ready.
+	origIsReady := isReady
+	isReady = func(_ *managedwriter.AppendResult) bool { return false }
+	defer func() { isReady = origIsReady }()
+
+	// pluginGetResult counts how many pending responses were drained.
+	var drainCount int
+	origGetResult := pluginGetResult
+	pluginGetResult = func(_ *managedwriter.AppendResult, _ context.Context) (int64, error) {
+		drainCount++
+		return -1, nil
+	}
+	defer func() { pluginGetResult = origGetResult }()
+
+	// Send one row via flush so AppendRows is called and a result is queued.
+	origDecoder := newDecoder
+	newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder { return nil }
+	defer func() { newDecoder = origDecoder }()
+
+	var rowSent bool
+	patchRecord := gomonkey.ApplyFunc(output.GetRecord, func(dec *output.FLBDecoder) (int, interface{}, map[interface{}]interface{}) {
+		if !rowSent {
+			rowSent = true
+			return 0, nil, map[interface{}]interface{}{"Text": []byte("hello")}
+		}
+		return 1, nil, nil
+	})
+	defer patchRecord.Reset()
+
+	pointerValue := unsafe.Pointer(&setID)
+	flushResult := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
+	assert.Equal(t, output.FLB_OK, flushResult)
+	assert.Equal(t, 1, appendRowsCalled) // one AppendRows call queued a result
+
+	// After flush, the queue holds 1 pending response (isReady=false so flush didn't drain it).
+	// FLBPluginExitCtx must drain it with waitForResponse=true.
+	assert.Equal(t, 0, drainCount) // not yet drained
+
+	exitResult := FLBPluginExitCtx(pointerValue)
+	assert.Equal(t, output.FLB_OK, exitResult)
+	assert.Equal(t, 1, drainCount) // drained during exit
 }
 
 // TestConvertTimestampFieldsRaw tests the convertTimestampFieldsRaw function

@@ -873,7 +873,7 @@ func FLBPluginExit() int {
 //export FLBPluginExitCtx
 func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 	// Get context
-	id := output.FLBPluginGetContext(ctx).(int)
+	id := getFLBPluginContext(ctx)
 
 	// Locate stream in map
 	config, ok := configMap[id]
@@ -882,9 +882,9 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 		return output.FLB_ERROR
 	}
 
-	// Calls checkResponses, finalizes, and closes each stream
-	// If there is an error it preserves it and then continues to close and finalize all other streams
-	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, false, &config.mutex, config.exactlyOnce, id)
+	// Drain all pending responses before closing streams to avoid data loss.
+	// waitForResponse=true blocks until every in-flight AppendRows result is received.
+	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, true, &config.mutex, config.exactlyOnce, id)
 	errFlag := finalizeCloseAllStreams(&config, id)
 
 	if config.client != nil {
