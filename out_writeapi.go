@@ -74,17 +74,17 @@ var (
 )
 
 const (
-	chunkSizeLimit             = 9 * 1024 * 1024
-	queueRequestDefault        = 1000
-	queueByteDefault           = 100 * 1024 * 1024
+	chunkSizeLimit             = 9 * 1024 * 1024 // BigQuery Storage Write API AppendRows hard limit (10MB minus overhead)
+	queueRequestDefault        = 1000             // default Max_Queue_Requests (max in-flight AppendRows per stream)
+	queueByteDefault           = 100 * 1024 * 1024 // default Max_Queue_Bytes: 100 MB
 	exactlyOnceDefault         = false
-	queueRequestScalingPercent = 0.8
+	queueRequestScalingPercent = 0.8  // queue utilization threshold (80%) above which a new stream is created
 	numRetriesDefault          = 4
-	maxNumStreamsPerInstance   = 10
-	minQueueRequests           = 10
+	maxNumStreamsPerInstance   = 10   // upper bound on dynamic stream count per output instance
+	minQueueRequests           = 10  // minimum Max_Queue_Requests accepted (prevents starvation during scaling)
 	dateTimeDefault            = true
-	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC in seconds
-	flushTimeoutSecDefault     = 30
+	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC; values above this are treated as already in microseconds
+	flushTimeoutSecDefault     = 30         // default Flush_Timeout_Sec: 30 seconds per flush call
 )
 
 // This function mangles the top-level and complex (struct) BigQuery schema to convert NUMERIC, BIGNUMERIC, DATETIME, TIME, and JSON fields to STRING.
@@ -404,7 +404,7 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config **outputConfi
 		if err == nil {
 			break
 		}
-		// Unsuccesful data append
+		// Unsuccessful data append
 		if rebuildPredicate(err) {
 			currStream.managedstream.Finalize(ctx)
 			currStream.managedstream.Close()
