@@ -880,7 +880,14 @@ func TestRawMapToBinary_MatchesMapToBinary(t *testing.T) {
 	parsedBytes, err := mapToBinary(md, parsedData, cache)
 	require.NoError(t, err)
 
-	assert.Equal(t, parsedBytes, rawBytes)
+	// Compare decoded messages instead of raw bytes: map iteration order is
+	// non-deterministic, so the two serializations may encode fields in
+	// different orders while remaining logically identical.
+	rawMsg := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(rawBytes, rawMsg))
+	parsedMsg := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(parsedBytes, parsedMsg))
+	assert.True(t, proto.Equal(rawMsg, parsedMsg))
 }
 
 // TestRawMapToBinary_BoolWithBytes tests []byte to bool conversion.
