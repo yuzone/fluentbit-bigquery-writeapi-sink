@@ -84,7 +84,7 @@ const (
 	minQueueRequests           = 10
 	dateTimeDefault            = true
 	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC in seconds
-	flushTimeoutSecDefault     = 60
+	flushTimeoutSecDefault     = 30
 )
 
 // This function mangles the top-level and complex (struct) BigQuery schema to convert NUMERIC, BIGNUMERIC, DATETIME, TIME, and JSON fields to STRING.
