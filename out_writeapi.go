@@ -906,6 +906,11 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 	if errFlag {
 		return output.FLB_ERROR
 	}
+
+	// Release messagePool entries for this config's descriptor tree so that
+	// the descriptors and their cached *dynamicpb.Message objects can be GC'd.
+	cleanupMsgPool(config.messageDescriptor)
+
 	return output.FLB_OK
 }
 
