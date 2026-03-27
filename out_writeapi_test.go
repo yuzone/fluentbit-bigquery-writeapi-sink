@@ -664,26 +664,27 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 	defer patchRecord.Reset()
 
 	// Creates new stream with a mock buildStream function to count the number of times we scale up
-	patchBuild := gomonkey.ApplyFunc(buildStream, func(ctx context.Context, config **outputConfig, streamIndex int) error {
+	origBuildStream := buildStream
+	buildStream = func(ctx context.Context, config *outputConfig, streamIndex int) error {
 		checks.buildStreamCalled++
-		currManagedStream, err := getWriter((*config).client, ctx, (*config).currProjectID,
-			managedwriter.WithType((*config).streamType),
-			managedwriter.WithDestinationTable((*config).tableRef),
+		currManagedStream, err := getWriter(config.client, ctx, config.currProjectID,
+			managedwriter.WithType(config.streamType),
+			managedwriter.WithDestinationTable(config.tableRef),
 			// Use the descriptor proto when creating the new managed stream
-			managedwriter.WithSchemaDescriptor((*config).schemaDesc),
-			managedwriter.EnableWriteRetries((*config).enableRetry),
-			managedwriter.WithMaxInflightBytes((*config).maxQueueBytes),
-			managedwriter.WithMaxInflightRequests((*config).maxQueueRequests),
+			managedwriter.WithSchemaDescriptor(config.schemaDesc),
+			managedwriter.EnableWriteRetries(config.enableRetry),
+			managedwriter.WithMaxInflightBytes(config.maxQueueBytes),
+			managedwriter.WithMaxInflightRequests(config.maxQueueRequests),
 		)
 
-		streamSlice := *(*config).managedStreamSlice
+		streamSlice := *config.managedStreamSlice
 
 		if err == nil {
 			(streamSlice)[streamIndex].managedstream = currManagedStream
 		}
 		return nil
-	})
-	defer patchBuild.Reset()
+	}
+	defer func() { buildStream = origBuildStream }()
 
 	// Converts id (int) to type unsafe.Pointer to be used as the ctx
 	// Use the address of setID instead of its value

@@ -348,21 +348,21 @@ func getConfigField[T int | bool](plugin unsafe.Pointer, key string, defaultval 
 	return finval, nil
 }
 
-// This function creates a new managed stream based on the config struct fields
-func buildStream(ctx context.Context, config **outputConfig, streamIndex int) error {
-	currManagedStream, err := getWriter((*config).client, ctx, (*config).currProjectID,
-		managedwriter.WithType((*config).streamType),
-		managedwriter.WithDestinationTable((*config).tableRef),
+// buildStream is a var so tests can replace it without gomonkey.
+var buildStream = func(ctx context.Context, config *outputConfig, streamIndex int) error {
+	currManagedStream, err := getWriter(config.client, ctx, config.currProjectID,
+		managedwriter.WithType(config.streamType),
+		managedwriter.WithDestinationTable(config.tableRef),
 		// Use the descriptor proto when creating the new managed stream
-		managedwriter.WithSchemaDescriptor((*config).schemaDesc),
-		managedwriter.EnableWriteRetries((*config).enableRetry),
-		managedwriter.WithMaxInflightBytes((*config).maxQueueBytes),
-		managedwriter.WithMaxInflightRequests((*config).maxQueueRequests),
+		managedwriter.WithSchemaDescriptor(config.schemaDesc),
+		managedwriter.EnableWriteRetries(config.enableRetry),
+		managedwriter.WithMaxInflightBytes(config.maxQueueBytes),
+		managedwriter.WithMaxInflightRequests(config.maxQueueRequests),
 		managedwriter.WithDefaultMissingValueInterpretation(storagepb.AppendRowsRequest_DEFAULT_VALUE),
 		managedwriter.WithTraceID("FluentBit"),
 	)
 
-	streamSlice := *(*config).managedStreamSlice
+	streamSlice := *config.managedStreamSlice
 
 	if err == nil {
 		(streamSlice)[streamIndex].managedstream = currManagedStream
@@ -382,11 +382,11 @@ func rebuildPredicate(err error) bool {
 }
 
 // This function sends and checks the responses for data through a committed stream with exactly once functionality
-func sendRequestExactlyOnce(ctx context.Context, data [][]byte, config **outputConfig, streamIndex int) error {
-	(*config).mutex.Lock()
-	defer (*config).mutex.Unlock()
+func sendRequestExactlyOnce(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
+	config.mutex.Lock()
+	defer config.mutex.Unlock()
 
-	currStream := (*(*config).managedStreamSlice)[streamIndex]
+	currStream := (*config.managedStreamSlice)[streamIndex]
 
 	appendResult, err := currStream.managedstream.AppendRows(ctx, data, managedwriter.WithOffset(currStream.offsetCounter))
 	if err != nil {
@@ -401,10 +401,10 @@ func sendRequestExactlyOnce(ctx context.Context, data [][]byte, config **outputC
 }
 
 // This function enables synchronous retries and rebuilding a valid stream based on the server response
-func sendRequestRetries(ctx context.Context, data [][]byte, config **outputConfig, streamIndex int) error {
-	retryer := newStatelessRetryer((*config).numRetries)
+func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
+	retryer := newStatelessRetryer(config.numRetries)
 	attempt := 0
-	currStream := (*(*config).managedStreamSlice)[streamIndex]
+	currStream := (*config.managedStreamSlice)[streamIndex]
 	for {
 		err := sendRequestExactlyOnce(ctx, data, config, streamIndex)
 		if err == nil {
@@ -435,10 +435,10 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config **outputConfi
 }
 
 // This function sends data and appends the responses to a queue to be checked asynchronously through a default stream with at least once functionality
-func sendRequestDefault(ctx context.Context, data [][]byte, config **outputConfig, streamIndex int) error {
-	(*config).mutex.Lock()
-	defer (*config).mutex.Unlock()
-	currStream := (*(*config).managedStreamSlice)[streamIndex]
+func sendRequestDefault(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
+	config.mutex.Lock()
+	defer config.mutex.Unlock()
+	currStream := (*config.managedStreamSlice)[streamIndex]
 
 	appendResult, err := currStream.managedstream.AppendRows(ctx, data)
 	if err != nil {
@@ -450,9 +450,9 @@ func sendRequestDefault(ctx context.Context, data [][]byte, config **outputConfi
 }
 
 // This function cases on the exactly/at-least once functionality and sends the data accordingly
-func sendRequest(ctx context.Context, data [][]byte, config **outputConfig, streamIndex int) error {
+func sendRequest(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
 	if len(data) > 0 {
-		if (*config).exactlyOnce {
+		if config.exactlyOnce {
 			return sendRequestRetries(ctx, data, config, streamIndex)
 		} else {
 			return sendRequestDefault(ctx, data, config, streamIndex)
@@ -497,13 +497,13 @@ var setThreshold = func(maxQueueSize int) int {
 
 // This function check whether there is room for scaling and the scales the number of stream dynamically depending on if it
 // Detects back pressure from the queue
-func createNewStreamDynamicScaling(ctx context.Context, config **outputConfig) {
-	(*config).mutex.Lock()
-	defer (*config).mutex.Unlock()
-	if len(*(*config).managedStreamSlice) < maxNumStreamsPerInstance {
+func createNewStreamDynamicScaling(ctx context.Context, config *outputConfig) {
+	config.mutex.Lock()
+	defer config.mutex.Unlock()
+	if len(*config.managedStreamSlice) < maxNumStreamsPerInstance {
 		// Gets stream with least values in queue
-		mostEfficient := getLeastLoadedStream((*config).managedStreamSlice)
-		mostEfficientQueueLength := len(*(*(*config).managedStreamSlice)[mostEfficient].appendResults)
+		mostEfficient := getLeastLoadedStream(config.managedStreamSlice)
+		mostEfficientQueueLength := len(*(*config.managedStreamSlice)[mostEfficient].appendResults)
 
 		var newResQueue []*managedwriter.AppendResult
 		var newStream = streamConfig{
@@ -511,14 +511,14 @@ func createNewStreamDynamicScaling(ctx context.Context, config **outputConfig) {
 			appendResults: &newResQueue,
 		}
 
-		if mostEfficientQueueLength > (*config).requestCountThreshold {
-			*(*config).managedStreamSlice = append(*(*config).managedStreamSlice, &newStream)
-			newStreamIndex := len(*(*config).managedStreamSlice) - 1
+		if mostEfficientQueueLength > config.requestCountThreshold {
+			*config.managedStreamSlice = append(*config.managedStreamSlice, &newStream)
+			newStreamIndex := len(*config.managedStreamSlice) - 1
 			err := buildStream(ctx, config, newStreamIndex)
 			if err != nil {
-				log.Printf("Creating an additional managed stream with destination table: %s failed in FLBPluginInit: %s", (*config).tableRef, err)
+				log.Printf("Creating an additional managed stream with destination table: %s failed in FLBPluginInit: %s", config.tableRef, err)
 				// If failure, failed stream is removed from slice
-				*(*config).managedStreamSlice = (*(*config).managedStreamSlice)[:newStreamIndex]
+				*config.managedStreamSlice = (*config.managedStreamSlice)[:newStreamIndex]
 			}
 
 		}
@@ -598,14 +598,14 @@ var getFLBPluginContext = func(ctx unsafe.Pointer) int {
 }
 
 // Finalizes and Closes all streams in slice for a given instance
-func finalizeCloseAllStreams(config **outputConfig, id int) bool {
-	(*config).mutex.Lock()
-	defer (*config).mutex.Unlock()
+func finalizeCloseAllStreams(config *outputConfig, id int) bool {
+	config.mutex.Lock()
+	defer config.mutex.Unlock()
 	errFlag := false
-	streamSlice := (*config).managedStreamSlice
-	for i := 0; i < len(*(*config).managedStreamSlice); i++ {
+	streamSlice := config.managedStreamSlice
+	for i := 0; i < len(*config.managedStreamSlice); i++ {
 		if (*streamSlice)[i].managedstream != nil {
-			if (*config).exactlyOnce {
+			if config.exactlyOnce {
 				if _, err := (*streamSlice)[i].managedstream.Finalize(ms_ctx); err != nil {
 					log.Printf("Finalizing managed stream for output instance with id %d and stream index %d failed in FLBPluginExit: %s", id, i, err)
 					errFlag = true
@@ -745,8 +745,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	}
 
 	// Create stream using NewManagedStream
-	configPointer := &config
-	err = buildStream(ms_ctx, &configPointer, 0)
+	err = buildStream(ms_ctx, &config, 0)
 	if err != nil {
 		log.Printf("Creating a new managed stream with destination table: %s failed in FLBPluginInit: %s", tableReference, err)
 		return output.FLB_ERROR
@@ -767,100 +766,94 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 	return output.FLB_OK
 }
 
+// flushChunk picks the least-loaded stream, sends binaryData, and (for
+// exactly-once mode) increments the stream's offset counter by rowCount.
+func flushChunk(ctx context.Context, config *outputConfig, id int, binaryData [][]byte, rowCount int64) {
+	config.mutex.Lock()
+	streamIndex := getLeastLoadedStream(config.managedStreamSlice)
+	config.mutex.Unlock()
+
+	if err := sendRequest(ctx, binaryData, config, streamIndex); err != nil {
+		log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
+		return
+	}
+	if config.exactlyOnce {
+		config.mutex.Lock()
+		(*config.managedStreamSlice)[streamIndex].offsetCounter += rowCount
+		config.mutex.Unlock()
+	}
+}
+
+// decodeAndSerializeRecords decodes Fluent Bit records from dec, serializes each
+// to proto binary, and accumulates them in binaryData. When the accumulated size
+// reaches config.maxChunkSize, it calls flushChunk and resets binaryData
+// (preserving capacity for reuse). It returns the remaining (unsent) binaryData
+// and the row count for the final chunk.
+func decodeAndSerializeRecords(ctx context.Context, config *outputConfig, id int, dec *output.FLBDecoder, binaryData [][]byte) ([][]byte, int64) {
+	var currsize int
+	var rowCounter int64
+
+	for {
+		ret, _, record := output.GetRecord(dec)
+		if ret != 0 {
+			break
+		}
+
+		convertTimestampFieldsRaw(record, config.timestampFields)
+
+		buf, err := rawMapToBinary(config.messageDescriptor, record, config.fieldCache)
+		if err != nil {
+			log.Printf("Transforming row with value:%v from map to binary data for output instance with id: %d failed in FLBPluginFlushCtx: %s", record, id, err)
+			continue
+		}
+
+		if (currsize + len(buf)) >= config.maxChunkSize {
+			flushChunk(ctx, config, id, binaryData, rowCounter)
+			rowCounter = 0
+			// Nil out sent elements so GC can reclaim them, then reset slice.
+			for i := range binaryData {
+				binaryData[i] = nil
+			}
+			binaryData = binaryData[:0]
+			currsize = 0
+		}
+		binaryData = append(binaryData, buf)
+		// Include the protobuf overhead in the size estimate.
+		currsize += (len(buf) + 2)
+		rowCounter++
+	}
+
+	return binaryData, rowCounter
+}
+
 //export FLBPluginFlushCtx
 func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int {
 	id := getFLBPluginContext(ctx)
-	// Locate stream in map
-	// Look up through reference
 	config, ok := configMap[id]
 	if !ok {
 		log.Printf("Finding configuration for output instance with id: %d failed in FLBPluginFlushCtx", id)
 		return output.FLB_ERROR
 	}
 
-	// Calls checkResponses for all streams in slice
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), config.flushTimeout)
 	defer flushCancel()
 
+	// Drain ready responses and check whether a new stream should be created.
 	checkAllStreamResponses(flushCtx, &config.managedStreamSlice, false, &config.mutex, config.exactlyOnce, id)
-	// Checks for need to dynamically scale
-	createNewStreamDynamicScaling(flushCtx, &config)
+	createNewStreamDynamicScaling(flushCtx, config)
 
-	// Create Fluent Bit decoder
-	dec := newDecoder(data, int(length))
 	// Reuse binaryData slice across flushes to avoid per-flush allocation.
 	// Nil out retained elements before reset so GC can reclaim previous batch's bytes.
 	for i := range config.binaryData {
 		config.binaryData[i] = nil
 	}
 	binaryData := config.binaryData[:0]
-	var currsize int
-	// Keeps track of the number of rows previously sent
-	var rowCounter int64
 
-	// Iterate Records
-	for {
-		// Extract Record
-		ret, _, record := output.GetRecord(dec)
-		if ret != 0 {
-			break
-		}
+	// Decode and serialize all records; mid-size chunks are sent inside the helper.
+	binaryData, rowCounter := decodeAndSerializeRecords(flushCtx, config, id, newDecoder(data, int(length)), binaryData)
 
-		// Convert timestamp fields in-place on the raw record
-		convertTimestampFieldsRaw(record, config.timestampFields)
-
-		// Serialize data directly from raw Fluent Bit record
-		buf, err := rawMapToBinary(config.messageDescriptor, record, config.fieldCache)
-		if err != nil {
-			log.Printf("Transforming row with value:%v from map to binary data for output instance with id: %d failed in FLBPluginFlushCtx: %s", record, id, err)
-		} else {
-			// Successful data transformation
-			if (currsize + len(buf)) >= config.maxChunkSize {
-				// Re-evaluate the least loaded stream per chunk to distribute load across streams.
-				config.mutex.Lock()
-				leastLoadedStreamIndex := getLeastLoadedStream(config.managedStreamSlice)
-				config.mutex.Unlock()
-
-				// Appending Rows
-				err := sendRequest(flushCtx, binaryData, &config, leastLoadedStreamIndex)
-				if err != nil {
-					log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
-				} else if config.exactlyOnce {
-					config.mutex.Lock()
-					(*config.managedStreamSlice)[leastLoadedStreamIndex].offsetCounter += rowCounter
-					config.mutex.Unlock()
-				}
-
-				rowCounter = 0
-
-				// Nil out sent elements so GC can reclaim them, then reset slice.
-				for i := range binaryData {
-					binaryData[i] = nil
-				}
-				binaryData = binaryData[:0]
-				currsize = 0
-
-			}
-			binaryData = append(binaryData, buf)
-			// Include the protobuf overhead to the currsize variable
-			currsize += (len(buf) + 2)
-			rowCounter++
-		}
-	}
-	// Re-evaluate the least loaded stream for the final chunk.
-	config.mutex.Lock()
-	leastLoadedStreamIndex := getLeastLoadedStream(config.managedStreamSlice)
-	config.mutex.Unlock()
-
-	// Appending Rows
-	err := sendRequest(flushCtx, binaryData, &config, leastLoadedStreamIndex)
-	if err != nil {
-		log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
-	} else if config.exactlyOnce {
-		config.mutex.Lock()
-		(*config.managedStreamSlice)[leastLoadedStreamIndex].offsetCounter += rowCounter
-		config.mutex.Unlock()
-	}
+	// Send the final (possibly partial) chunk.
+	flushChunk(flushCtx, config, id, binaryData, rowCounter)
 
 	// Write back the grown slice so its capacity is reused on the next flush.
 	config.binaryData = binaryData
@@ -889,7 +882,7 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 	// Drain all pending responses before closing streams to avoid data loss.
 	// waitForResponse=true blocks until every in-flight AppendRows result is received.
 	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, true, &config.mutex, config.exactlyOnce, id)
-	errFlag := finalizeCloseAllStreams(&config, id)
+	errFlag := finalizeCloseAllStreams(config, id)
 
 	if config.client != nil {
 		if err := config.client.Close(); err != nil {
