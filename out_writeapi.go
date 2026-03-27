@@ -63,6 +63,7 @@ type outputConfig struct {
 	numRetries            int
 	timestampFields       []string
 	fieldCache            fieldLookupCache
+	flushTimeout          time.Duration
 }
 
 var (
@@ -82,6 +83,7 @@ const (
 	minQueueRequests           = 10
 	dateTimeDefault            = true
 	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC in seconds
+	flushTimeoutSecDefault     = 60
 )
 
 // This function mangles the top-level and complex (struct) BigQuery schema to convert NUMERIC, BIGNUMERIC, DATETIME, TIME, and JSON fields to STRING.
@@ -488,7 +490,7 @@ var setThreshold = func(maxQueueSize int) int {
 
 // This function check whether there is room for scaling and the scales the number of stream dynamically depending on if it
 // Detects back pressure from the queue
-func createNewStreamDynamicScaling(config **outputConfig) {
+func createNewStreamDynamicScaling(ctx context.Context, config **outputConfig) {
 	(*config).mutex.Lock()
 	defer (*config).mutex.Unlock()
 	if len(*(*config).managedStreamSlice) < maxNumStreamsPerInstance {
@@ -505,7 +507,7 @@ func createNewStreamDynamicScaling(config **outputConfig) {
 		if mostEfficientQueueLength > (*config).requestCountThreshold {
 			*(*config).managedStreamSlice = append(*(*config).managedStreamSlice, &newStream)
 			newStreamIndex := len(*(*config).managedStreamSlice) - 1
-			err := buildStream(ms_ctx, config, newStreamIndex)
+			err := buildStream(ctx, config, newStreamIndex)
 			if err != nil {
 				log.Printf("Creating an additional managed stream with destination table: %s failed in FLBPluginInit: %s", (*config).tableRef, err)
 				// If failure, failed stream is removed from slice
@@ -572,6 +574,11 @@ type MWManagedStream interface {
 // To inject a mock interface, we can override getWriter and getContext
 var getWriter = func(client ManagedWriterClient, ctx context.Context, projectID string, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
 	return client.NewManagedStream(ctx, opts...)
+}
+
+// newDecoder is a wrapper around output.NewDecoder to allow test injection.
+var newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	return output.NewDecoder(data, length)
 }
 
 // This function acts as a wrapper for the GetContext function so that we may override it to
@@ -664,6 +671,13 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		return output.FLB_ERROR
 	}
 
+	// Optional flush timeout parameter
+	flushTimeoutSec, err := getConfigField(plugin, "Flush_Timeout_Sec", flushTimeoutSecDefault)
+	if err != nil {
+		log.Printf("Invalid Flush_Timeout_Sec parameter in configuration file: %s", err)
+		return output.FLB_ERROR
+	}
+
 	// Create new client
 	client, err := getClient(ms_ctx, projectID)
 	if err != nil {
@@ -720,6 +734,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		managedStreamSlice:    &streamSlice,
 		timestampFields:       timestampFields,
 		fieldCache:            buildFieldLookupCache(md),
+		flushTimeout:          time.Duration(flushTimeoutSec) * time.Second,
 	}
 
 	// Create stream using NewManagedStream
@@ -759,12 +774,15 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	}
 
 	// Calls checkResponses for all streams in slice
-	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, false, &config.mutex, config.exactlyOnce, id)
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), config.flushTimeout)
+	defer flushCancel()
+
+	checkAllStreamResponses(flushCtx, &config.managedStreamSlice, false, &config.mutex, config.exactlyOnce, id)
 	// Checks for need to dynamically scale
-	createNewStreamDynamicScaling(&config)
+	createNewStreamDynamicScaling(flushCtx, &config)
 
 	// Create Fluent Bit decoder
-	dec := output.NewDecoder(data, int(length))
+	dec := newDecoder(data, int(length))
 	// Pre-allocate binaryData slice to reduce append-driven growth (#5)
 	binaryData := make([][]byte, 0, 256)
 	var currsize int
@@ -795,7 +813,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 				config.mutex.Unlock()
 
 				// Appending Rows
-				err := sendRequest(ms_ctx, binaryData, &config, leastLoadedStreamIndex)
+				err := sendRequest(flushCtx, binaryData, &config, leastLoadedStreamIndex)
 				if err != nil {
 					log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
 				} else if config.exactlyOnce {
@@ -823,7 +841,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	config.mutex.Unlock()
 
 	// Appending Rows
-	err := sendRequest(ms_ctx, binaryData, &config, leastLoadedStreamIndex)
+	err := sendRequest(flushCtx, binaryData, &config, leastLoadedStreamIndex)
 	if err != nil {
 		log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
 	} else if config.exactlyOnce {

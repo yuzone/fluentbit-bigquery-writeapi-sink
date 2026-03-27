@@ -446,11 +446,12 @@ func TestFLBPluginFlushCtx(t *testing.T) {
 	}
 	defer func() { pluginGetResult = origResultFunc }()
 
-	patchDecoder := gomonkey.ApplyFunc(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	origDecoderFn := newDecoder
+	newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder {
 		checks.createDecoder++
 		return nil
-	})
-	defer patchDecoder.Reset()
+	}
+	defer func() { newDecoder = origDecoderFn }()
 
 	var rowSent int = 0
 	var rowCount int = 5
@@ -631,10 +632,11 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 	}
 	defer func() { pluginGetResult = origResultFunc }()
 
-	patchDecoder := gomonkey.ApplyFunc(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	origDecoder634 := newDecoder
+	newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder {
 		return nil
-	})
-	defer patchDecoder.Reset()
+	}
+	defer func() { newDecoder = origDecoder634 }()
 
 	// Sending rows and data
 	var rowSent int = 0
@@ -814,11 +816,12 @@ func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 	}
 	defer func() { pluginGetResult = origResultFunc }()
 
-	patchDecoder := gomonkey.ApplyFunc(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	origDecoderFn := newDecoder
+	newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder {
 		checks.createDecoder++
 		return nil
-	})
-	defer patchDecoder.Reset()
+	}
+	defer func() { newDecoder = origDecoderFn }()
 
 	var rowSent int = 0
 	var rowCount int = 5
@@ -995,11 +998,12 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	}
 	defer func() { pluginGetResult = origResultFunc }()
 
-	patchDecoder := gomonkey.ApplyFunc(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+	origDecoderFn := newDecoder
+	newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder {
 		checks.createDecoder++
 		return nil
-	})
-	defer patchDecoder.Reset()
+	}
+	defer func() { newDecoder = origDecoderFn }()
 
 	var rowSent int = 0
 	var rowCount int = 5
