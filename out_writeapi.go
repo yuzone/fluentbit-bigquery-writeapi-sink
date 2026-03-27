@@ -65,7 +65,6 @@ type outputConfig struct {
 	timestampFields       []string
 	fieldCache            fieldLookupCache
 	flushTimeout          time.Duration
-	binaryData            [][]byte // reused across flushes to avoid per-flush allocation
 }
 
 var (
@@ -381,7 +380,9 @@ func rebuildPredicate(err error) bool {
 	return false
 }
 
-// This function sends and checks the responses for data through a committed stream with exactly once functionality
+// This function sends and checks the responses for data through a committed stream with exactly once functionality.
+// On success the stream's offsetCounter is incremented by len(data) within the same mutex critical section
+// as the append, preventing TOCTOU races when workers > 1.
 func sendRequestExactlyOnce(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
 	config.mutex.Lock()
 	defer config.mutex.Unlock()
@@ -397,14 +398,19 @@ func sendRequestExactlyOnce(ctx context.Context, data [][]byte, config *outputCo
 	if err != nil {
 		return err
 	}
+	// Increment the offset inside the same lock so no other worker can read a stale offset value.
+	currStream.offsetCounter += int64(len(data))
 	return nil
 }
 
-// This function enables synchronous retries and rebuilding a valid stream based on the server response
+// This function enables synchronous retries and rebuilding a valid stream based on the server response.
+// The mutex is held while closing and rebuilding the stream (rebuildPredicate path) so that no other
+// worker (workers > 1 scenario) can use the stream concurrently during the teardown/rebuild.
+// Note: this means network I/O (Finalize, Close, buildStream) runs under the lock on that path,
+// which is a known trade-off; see issue #12 in docs/code-analysis.md.
 func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
 	retryer := newStatelessRetryer(config.numRetries)
 	attempt := 0
-	currStream := (*config.managedStreamSlice)[streamIndex]
 	for {
 		err := sendRequestExactlyOnce(ctx, data, config, streamIndex)
 		if err == nil {
@@ -412,12 +418,17 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig
 		}
 		// Unsuccessful data append
 		if rebuildPredicate(err) {
+			// Hold the mutex while closing and rebuilding the stream so no concurrent
+			// worker (workers > 1) can observe a partially-closed or replaced stream.
+			config.mutex.Lock()
+			currStream := (*config.managedStreamSlice)[streamIndex]
 			currStream.managedstream.Finalize(ctx)
 			currStream.managedstream.Close()
 			// Rebuild stream
-			err := buildStream(ctx, config, streamIndex)
-			if err != nil {
-				return err
+			buildErr := buildStream(ctx, config, streamIndex)
+			config.mutex.Unlock()
+			if buildErr != nil {
+				return buildErr
 			}
 			// Retry sending data without incrementing number of attempts or waiting between attempts
 		} else {
@@ -766,9 +777,11 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 	return output.FLB_OK
 }
 
-// flushChunk picks the least-loaded stream, sends binaryData, and (for
-// exactly-once mode) increments the stream's offset counter by rowCount.
-func flushChunk(ctx context.Context, config *outputConfig, id int, binaryData [][]byte, rowCount int64) {
+// flushChunk picks the least-loaded stream and sends binaryData.
+// For exactly-once mode the stream's offsetCounter is incremented by len(binaryData)
+// inside sendRequestExactlyOnce within the same mutex critical section as the
+// AppendRows call, preventing TOCTOU races when workers > 1.
+func flushChunk(ctx context.Context, config *outputConfig, id int, binaryData [][]byte) {
 	config.mutex.Lock()
 	streamIndex := getLeastLoadedStream(config.managedStreamSlice)
 	config.mutex.Unlock()
@@ -777,21 +790,14 @@ func flushChunk(ctx context.Context, config *outputConfig, id int, binaryData []
 		log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
 		return
 	}
-	if config.exactlyOnce {
-		config.mutex.Lock()
-		(*config.managedStreamSlice)[streamIndex].offsetCounter += rowCount
-		config.mutex.Unlock()
-	}
 }
 
 // decodeAndSerializeRecords decodes Fluent Bit records from dec, serializes each
 // to proto binary, and accumulates them in binaryData. When the accumulated size
 // reaches config.maxChunkSize, it calls flushChunk and resets binaryData
-// (preserving capacity for reuse). It returns the remaining (unsent) binaryData
-// and the row count for the final chunk.
-func decodeAndSerializeRecords(ctx context.Context, config *outputConfig, id int, dec *output.FLBDecoder, binaryData [][]byte) ([][]byte, int64) {
+// (preserving capacity for reuse). It returns the remaining (unsent) binaryData.
+func decodeAndSerializeRecords(ctx context.Context, config *outputConfig, id int, dec *output.FLBDecoder, binaryData [][]byte) [][]byte {
 	var currsize int
-	var rowCounter int64
 
 	for {
 		ret, _, record := output.GetRecord(dec)
@@ -808,8 +814,7 @@ func decodeAndSerializeRecords(ctx context.Context, config *outputConfig, id int
 		}
 
 		if (currsize + len(buf)) >= config.maxChunkSize {
-			flushChunk(ctx, config, id, binaryData, rowCounter)
-			rowCounter = 0
+			flushChunk(ctx, config, id, binaryData)
 			// Nil out sent elements so GC can reclaim them, then reset slice.
 			for i := range binaryData {
 				binaryData[i] = nil
@@ -820,10 +825,9 @@ func decodeAndSerializeRecords(ctx context.Context, config *outputConfig, id int
 		binaryData = append(binaryData, buf)
 		// Include the protobuf overhead in the size estimate.
 		currsize += (len(buf) + 2)
-		rowCounter++
 	}
 
-	return binaryData, rowCounter
+	return binaryData
 }
 
 //export FLBPluginFlushCtx
@@ -842,21 +846,15 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	checkAllStreamResponses(flushCtx, &config.managedStreamSlice, false, &config.mutex, config.exactlyOnce, id)
 	createNewStreamDynamicScaling(flushCtx, config)
 
-	// Reuse binaryData slice across flushes to avoid per-flush allocation.
-	// Nil out retained elements before reset so GC can reclaim previous batch's bytes.
-	for i := range config.binaryData {
-		config.binaryData[i] = nil
-	}
-	binaryData := config.binaryData[:0]
+	// binaryData is a flush-local buffer. Each worker (workers > 1) gets its own
+	// stack frame, so there is no shared state and no mutex needed here.
+	binaryData := make([][]byte, 0, 64)
 
 	// Decode and serialize all records; mid-size chunks are sent inside the helper.
-	binaryData, rowCounter := decodeAndSerializeRecords(flushCtx, config, id, newDecoder(data, int(length)), binaryData)
+	binaryData = decodeAndSerializeRecords(flushCtx, config, id, newDecoder(data, int(length)), binaryData)
 
 	// Send the final (possibly partial) chunk.
-	flushChunk(flushCtx, config, id, binaryData, rowCounter)
-
-	// Write back the grown slice so its capacity is reused on the next flush.
-	config.binaryData = binaryData
+	flushChunk(flushCtx, config, id, binaryData)
 
 	return output.FLB_OK
 }
