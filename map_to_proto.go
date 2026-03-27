@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"unsafe"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -434,7 +435,7 @@ func toProtoString(val interface{}) (protoreflect.Value, error) {
 	case string:
 		return protoreflect.ValueOfString(v), nil
 	case []byte:
-		return protoreflect.ValueOfString(string(v)), nil
+		return protoreflect.ValueOfString(unsafe.String(unsafe.SliceData(v), len(v))), nil
 	case int:
 		return protoreflect.ValueOfString(strconv.Itoa(v)), nil
 	case int64:
@@ -478,7 +479,16 @@ func toProtoInt64(val interface{}) (protoreflect.Value, error) {
 		}
 		return protoreflect.ValueOfInt64(i), nil
 	case []byte:
-		return toProtoInt64(string(v))
+		s := unsafe.String(unsafe.SliceData(v), len(v))
+		i, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			f, ferr := strconv.ParseFloat(s, 64)
+			if ferr != nil {
+				return protoreflect.Value{}, fmt.Errorf("cannot convert []byte %q to int64: %w", v, err)
+			}
+			return protoreflect.ValueOfInt64(int64(f)), nil
+		}
+		return protoreflect.ValueOfInt64(i), nil
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to int64", val)
 	}
@@ -507,7 +517,11 @@ func toProtoInt32(val interface{}) (protoreflect.Value, error) {
 		}
 		return protoreflect.ValueOfInt32(int32(i)), nil
 	case []byte:
-		return toProtoInt32(string(v))
+		i, err := strconv.ParseInt(unsafe.String(unsafe.SliceData(v), len(v)), 10, 32)
+		if err != nil {
+			return protoreflect.Value{}, fmt.Errorf("cannot convert []byte %q to int32: %w", v, err)
+		}
+		return protoreflect.ValueOfInt32(int32(i)), nil
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to int32", val)
 	}
@@ -532,7 +546,11 @@ func toProtoUint64(val interface{}) (protoreflect.Value, error) {
 		}
 		return protoreflect.ValueOfUint64(u), nil
 	case []byte:
-		return toProtoUint64(string(v))
+		u, err := strconv.ParseUint(unsafe.String(unsafe.SliceData(v), len(v)), 10, 64)
+		if err != nil {
+			return protoreflect.Value{}, fmt.Errorf("cannot convert []byte %q to uint64: %w", v, err)
+		}
+		return protoreflect.ValueOfUint64(u), nil
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to uint64", val)
 	}
@@ -557,7 +575,11 @@ func toProtoUint32(val interface{}) (protoreflect.Value, error) {
 		}
 		return protoreflect.ValueOfUint32(uint32(u)), nil
 	case []byte:
-		return toProtoUint32(string(v))
+		u, err := strconv.ParseUint(unsafe.String(unsafe.SliceData(v), len(v)), 10, 32)
+		if err != nil {
+			return protoreflect.Value{}, fmt.Errorf("cannot convert []byte %q to uint32: %w", v, err)
+		}
+		return protoreflect.ValueOfUint32(uint32(u)), nil
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to uint32", val)
 	}
@@ -582,7 +604,11 @@ func toProtoDouble(val interface{}) (protoreflect.Value, error) {
 		}
 		return protoreflect.ValueOfFloat64(f), nil
 	case []byte:
-		return toProtoDouble(string(v))
+		f, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(v), len(v)), 64)
+		if err != nil {
+			return protoreflect.Value{}, fmt.Errorf("cannot convert []byte %q to float64: %w", v, err)
+		}
+		return protoreflect.ValueOfFloat64(f), nil
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to float64", val)
 	}
@@ -605,7 +631,11 @@ func toProtoFloat(val interface{}) (protoreflect.Value, error) {
 		}
 		return protoreflect.ValueOfFloat32(float32(f)), nil
 	case []byte:
-		return toProtoFloat(string(v))
+		f, err := strconv.ParseFloat(unsafe.String(unsafe.SliceData(v), len(v)), 32)
+		if err != nil {
+			return protoreflect.Value{}, fmt.Errorf("cannot convert []byte %q to float32: %w", v, err)
+		}
+		return protoreflect.ValueOfFloat32(float32(f)), nil
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to float32", val)
 	}
@@ -630,7 +660,11 @@ func toProtoBool(val interface{}) (protoreflect.Value, error) {
 	case float64:
 		return protoreflect.ValueOfBool(v != 0), nil
 	case []byte:
-		return toProtoBool(string(v))
+		b, err := strconv.ParseBool(unsafe.String(unsafe.SliceData(v), len(v)))
+		if err != nil {
+			return protoreflect.Value{}, fmt.Errorf("cannot convert []byte %q to bool: %w", v, err)
+		}
+		return protoreflect.ValueOfBool(b), nil
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to bool", val)
 	}
@@ -676,7 +710,11 @@ func toProtoEnum(val interface{}) (protoreflect.Value, error) {
 		}
 		return protoreflect.ValueOfEnum(protoreflect.EnumNumber(i)), nil
 	case []byte:
-		return toProtoEnum(string(v))
+		i, err := strconv.ParseInt(unsafe.String(unsafe.SliceData(v), len(v)), 10, 32)
+		if err != nil {
+			return protoreflect.Value{}, fmt.Errorf("cannot convert []byte %q to enum: %w", v, err)
+		}
+		return protoreflect.ValueOfEnum(protoreflect.EnumNumber(i)), nil
 	default:
 		return protoreflect.Value{}, fmt.Errorf("cannot convert %T to enum", val)
 	}

@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -70,7 +71,7 @@ type outputConfig struct {
 var (
 	ms_ctx    = context.Background()
 	configMap = make(map[int]*outputConfig)
-	configID  = 0
+	configID  atomic.Int64
 )
 
 const (
@@ -286,25 +287,30 @@ var pluginGetResult = func(result *managedwriter.AppendResult, ctx context.Conte
 // And wait for the next ready response from WriteAPI
 // This function returns an int which is the length of the queue after being checked or -1 if an error occured
 func checkResponses(curr_ctx context.Context, streamSlice *[]*streamConfig, waitForResponse bool, exactlyOnceConf bool, id int, streamIndex int) int {
-	currQueuePointer := (*streamSlice)[streamIndex].appendResults
-	for len(*currQueuePointer) > 0 {
-		if exactlyOnceConf {
-			log.Printf("Asynchronous response queue has non-zero size when exactly-once is configured")
-			break
-		}
-		queueHead := (*currQueuePointer)[0]
-		if waitForResponse || isReady(queueHead) {
-			_, err := pluginGetResult(queueHead, curr_ctx)
-			*currQueuePointer = (*currQueuePointer)[1:]
+	currQueue := (*streamSlice)[streamIndex].appendResults
+	if exactlyOnceConf && len(*currQueue) > 0 {
+		log.Printf("Asynchronous response queue has non-zero size when exactly-once is configured")
+		return len(*currQueue)
+	}
+	writeIdx := 0
+	for readIdx := 0; readIdx < len(*currQueue); readIdx++ {
+		result := (*currQueue)[readIdx]
+		if waitForResponse || isReady(result) {
+			_, err := pluginGetResult(result, curr_ctx)
 			if err != nil {
 				log.Printf("Encountered error:%s while verifying the server response to a data append for output instance with id: %d", err, id)
 			}
 		} else {
-			break
+			(*currQueue)[writeIdx] = result
+			writeIdx++
 		}
-
 	}
-	return len(*currQueuePointer)
+	// nil out drained slots to allow GC to reclaim AppendResult pointers
+	for i := writeIdx; i < len(*currQueue); i++ {
+		(*currQueue)[i] = nil
+	}
+	*currQueue = (*currQueue)[:writeIdx]
+	return writeIdx
 }
 
 // This function checks the responses for all streams in the slice for each instance
@@ -746,13 +752,11 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		return output.FLB_ERROR
 	}
 
-	configMap[configID] = &config
+	id := int(configID.Add(1) - 1)
+	configMap[id] = &config
 
 	// Creating FLB context for each output, enables multiinstancing
-	config.mutex.Lock()
-	output.FLBPluginSetContext(plugin, configID)
-	configID = configID + 1
-	config.mutex.Unlock()
+	output.FLBPluginSetContext(plugin, id)
 
 	return output.FLB_OK
 }
