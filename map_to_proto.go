@@ -91,8 +91,24 @@ func getPooledMessage(md protoreflect.MessageDescriptor) *dynamicpb.Message {
 // putPooledMessage clears all populated fields and returns the message to the pool.
 // Clearing via Range+Clear preserves internal map bucket memory so that
 // subsequent reuse avoids re-growing the map.
+// Sub-messages (RECORD fields) are recursively returned to the pool before
+// their parent field is cleared, enabling full reuse across the message tree.
 func putPooledMessage(msg *dynamicpb.Message) {
-	msg.Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+	msg.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
+			if fd.IsList() {
+				list := v.List()
+				for i := 0; i < list.Len(); i++ {
+					if subMsg, ok := list.Get(i).Message().(*dynamicpb.Message); ok {
+						putPooledMessage(subMsg)
+					}
+				}
+			} else {
+				if subMsg, ok := v.Message().(*dynamicpb.Message); ok {
+					putPooledMessage(subMsg)
+				}
+			}
+		}
 		msg.Clear(fd)
 		return true
 	})
@@ -156,11 +172,13 @@ func rawMapToBinary(md protoreflect.MessageDescriptor, rawData map[interface{}]i
 	return marshalAndRelease(msg)
 }
 
-// mapToMessage creates a new dynamicpb.Message and populates it from a map[string]interface{}.
-// Used for nested sub-messages (which are not pooled).
+// mapToMessage retrieves a pooled dynamicpb.Message and populates it from a map[string]interface{}.
+// Used for nested sub-messages. The caller must not release the returned message directly;
+// it will be recursively released when the top-level message is passed to marshalAndRelease.
 func mapToMessage(md protoreflect.MessageDescriptor, data map[string]interface{}, cache fieldLookupCache) (*dynamicpb.Message, error) {
-	msg := dynamicpb.NewMessage(md)
+	msg := getPooledMessage(md)
 	if err := populateMessage(msg, md, data, cache); err != nil {
+		putPooledMessage(msg)
 		return nil, err
 	}
 	return msg, nil
@@ -253,8 +271,9 @@ func rawPopulateMessage(msg *dynamicpb.Message, md protoreflect.MessageDescripto
 		} else if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
 			switch sub := val.(type) {
 			case map[interface{}]interface{}:
-				subMsg := dynamicpb.NewMessage(fd.Message())
+				subMsg := getPooledMessage(fd.Message())
 				if err := rawPopulateMessage(subMsg, fd.Message(), sub, cache); err != nil {
+					putPooledMessage(subMsg)
 					return fmt.Errorf("field %q: %w", key, err)
 				}
 				msg.Set(fd, protoreflect.ValueOfMessage(subMsg))
@@ -354,8 +373,9 @@ func rawSetRepeatedField(msg *dynamicpb.Message, fd protoreflect.FieldDescriptor
 		if fd.Kind() == protoreflect.MessageKind || fd.Kind() == protoreflect.GroupKind {
 			switch sub := item.(type) {
 			case map[interface{}]interface{}:
-				subMsg := dynamicpb.NewMessage(fd.Message())
+				subMsg := getPooledMessage(fd.Message())
 				if err := rawPopulateMessage(subMsg, fd.Message(), sub, cache); err != nil {
+					putPooledMessage(subMsg)
 					return fmt.Errorf("element %d: %w", i, err)
 				}
 				list.Append(protoreflect.ValueOfMessage(subMsg))

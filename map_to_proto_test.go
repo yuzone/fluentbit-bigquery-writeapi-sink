@@ -15,6 +15,7 @@ package main
 
 import (
 	"encoding/base64"
+	"fmt"
 	"testing"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
@@ -1014,6 +1015,130 @@ func TestMessagePoolReuse_RawPath(t *testing.T) {
 	require.NoError(t, proto.Unmarshal(b2, msg2))
 	assert.Equal(t, "second", msg2.Get(md.Fields().ByName("x")).String())
 	assert.Equal(t, int64(0), msg2.Get(md.Fields().ByName("y")).Int()) // must be default
+}
+
+// TestMessagePoolReuse_NestedRecord verifies that pooled sub-messages (RECORD fields)
+// produce correct output across multiple sequential calls.
+func TestMessagePoolReuse_NestedRecord(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "id", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{
+				Name: "meta",
+				Type: storagepb.TableFieldSchema_STRUCT,
+				Mode: storagepb.TableFieldSchema_NULLABLE,
+				Fields: []*storagepb.TableFieldSchema{
+					{Name: "source", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+					{Name: "value", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+				},
+			},
+		},
+	}
+	md := buildMD(t, schema)
+	cache := buildFieldLookupCache(md)
+
+	// Call mapToBinary 100 times; sub-messages should be pooled and reused
+	for i := 0; i < 100; i++ {
+		data := map[string]interface{}{
+			"id": fmt.Sprintf("row-%d", i),
+			"meta": map[string]interface{}{
+				"source": "test",
+				"value":  int64(i),
+			},
+		}
+		b, err := mapToBinary(md, data, cache)
+		require.NoError(t, err)
+
+		msg := dynamicpb.NewMessage(md)
+		require.NoError(t, proto.Unmarshal(b, msg))
+		assert.Equal(t, fmt.Sprintf("row-%d", i), msg.Get(md.Fields().ByName("id")).String())
+		metaMsg := msg.Get(md.Fields().ByName("meta")).Message()
+		metaMd := md.Fields().ByName("meta").Message()
+		assert.Equal(t, "test", metaMsg.Get(metaMd.Fields().ByName("source")).String())
+		assert.Equal(t, int64(i), metaMsg.Get(metaMd.Fields().ByName("value")).Int())
+	}
+}
+
+// TestMessagePoolReuse_NoStaleFields_NestedRecord verifies that fields set inside a
+// nested RECORD in one call do not leak into the next call after pool reuse.
+func TestMessagePoolReuse_NoStaleFields_NestedRecord(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{
+				Name: "info",
+				Type: storagepb.TableFieldSchema_STRUCT,
+				Mode: storagepb.TableFieldSchema_NULLABLE,
+				Fields: []*storagepb.TableFieldSchema{
+					{Name: "a", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+					{Name: "b", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+				},
+			},
+		},
+	}
+	md := buildMD(t, schema)
+	cache := buildFieldLookupCache(md)
+	infaMd := md.Fields().ByName("info").Message()
+
+	// First call sets both nested fields
+	b1, err := mapToBinary(md, map[string]interface{}{
+		"info": map[string]interface{}{"a": "hello", "b": "world"},
+	}, cache)
+	require.NoError(t, err)
+	msg1 := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b1, msg1))
+	assert.Equal(t, "hello", msg1.Get(md.Fields().ByName("info")).Message().Get(infaMd.Fields().ByName("a")).String())
+	assert.Equal(t, "world", msg1.Get(md.Fields().ByName("info")).Message().Get(infaMd.Fields().ByName("b")).String())
+
+	// Second call sets only "a" — "b" must NOT carry over from pooled sub-message
+	b2, err := mapToBinary(md, map[string]interface{}{
+		"info": map[string]interface{}{"a": "only-a"},
+	}, cache)
+	require.NoError(t, err)
+	msg2 := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b2, msg2))
+	assert.Equal(t, "only-a", msg2.Get(md.Fields().ByName("info")).Message().Get(infaMd.Fields().ByName("a")).String())
+	assert.Equal(t, "", msg2.Get(md.Fields().ByName("info")).Message().Get(infaMd.Fields().ByName("b")).String())
+}
+
+// TestMessagePoolReuse_RawPath_NestedRecord verifies pool reuse for nested RECORD
+// fields via the rawMapToBinary path (map[interface{}]interface{} input).
+func TestMessagePoolReuse_RawPath_NestedRecord(t *testing.T) {
+	schema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{
+				Name: "nested",
+				Type: storagepb.TableFieldSchema_STRUCT,
+				Mode: storagepb.TableFieldSchema_NULLABLE,
+				Fields: []*storagepb.TableFieldSchema{
+					{Name: "x", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+					{Name: "y", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+				},
+			},
+		},
+	}
+	md := buildMD(t, schema)
+	cache := buildFieldLookupCache(md)
+	nestedMd := md.Fields().ByName("nested").Message()
+
+	// First call: set both nested fields
+	b1, err := rawMapToBinary(md, map[interface{}]interface{}{
+		"nested": map[interface{}]interface{}{"x": []byte("first"), "y": int64(1)},
+	}, cache)
+	require.NoError(t, err)
+	msg1 := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b1, msg1))
+	assert.Equal(t, "first", msg1.Get(md.Fields().ByName("nested")).Message().Get(nestedMd.Fields().ByName("x")).String())
+	assert.Equal(t, int64(1), msg1.Get(md.Fields().ByName("nested")).Message().Get(nestedMd.Fields().ByName("y")).Int())
+
+	// Second call: set only "x" — "y" must NOT carry over from pooled sub-message
+	b2, err := rawMapToBinary(md, map[interface{}]interface{}{
+		"nested": map[interface{}]interface{}{"x": []byte("second")},
+	}, cache)
+	require.NoError(t, err)
+	msg2 := dynamicpb.NewMessage(md)
+	require.NoError(t, proto.Unmarshal(b2, msg2))
+	assert.Equal(t, "second", msg2.Get(md.Fields().ByName("nested")).Message().Get(nestedMd.Fields().ByName("x")).String())
+	assert.Equal(t, int64(0), msg2.Get(md.Fields().ByName("nested")).Message().Get(nestedMd.Fields().ByName("y")).Int())
 }
 
 // BenchmarkRawMapToBinary benchmarks the raw map[interface{}]interface{} path.
