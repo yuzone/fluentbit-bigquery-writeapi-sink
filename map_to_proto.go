@@ -89,6 +89,29 @@ func getPooledMessage(md protoreflect.MessageDescriptor) *dynamicpb.Message {
 	return p.(*sync.Pool).Get().(*dynamicpb.Message)
 }
 
+// cleanupMsgPool removes all messagePool entries for the descriptor tree
+// rooted at md. Call this when an outputConfig is torn down to prevent
+// pool entries (and their associated descriptor references) from accumulating
+// across init/exit cycles.
+func cleanupMsgPool(md protoreflect.MessageDescriptor) {
+	cleanupMsgPoolRecursive(md, make(map[protoreflect.MessageDescriptor]bool))
+}
+
+func cleanupMsgPoolRecursive(md protoreflect.MessageDescriptor, visited map[protoreflect.MessageDescriptor]bool) {
+	if visited[md] {
+		return
+	}
+	visited[md] = true
+	messagePool.Delete(md)
+	fields := md.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		f := fields.Get(i)
+		if f.Kind() == protoreflect.MessageKind || f.Kind() == protoreflect.GroupKind {
+			cleanupMsgPoolRecursive(f.Message(), visited)
+		}
+	}
+}
+
 // putPooledMessage clears all populated fields and returns the message to the pool.
 // Clearing via Range+Clear preserves internal map bucket memory so that
 // subsequent reuse avoids re-growing the map.

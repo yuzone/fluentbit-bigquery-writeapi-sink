@@ -1141,6 +1141,68 @@ func TestMessagePoolReuse_RawPath_NestedRecord(t *testing.T) {
 	assert.Equal(t, int64(0), msg2.Get(md.Fields().ByName("nested")).Message().Get(nestedMd.Fields().ByName("y")).Int())
 }
 
+// TestCleanupMsgPool verifies that cleanupMsgPool removes all messagePool
+// entries for a flat schema and a nested (STRUCT) schema.
+func TestCleanupMsgPool(t *testing.T) {
+	t.Run("flat schema", func(t *testing.T) {
+		schema := &storagepb.TableSchema{
+			Fields: []*storagepb.TableFieldSchema{
+				{Name: "name", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+				{Name: "count", Type: storagepb.TableFieldSchema_INT64, Mode: storagepb.TableFieldSchema_NULLABLE},
+			},
+		}
+		md := buildMD(t, schema)
+		cache := buildFieldLookupCache(md)
+
+		// Populate the pool by serialising one record.
+		_, err := mapToBinary(md, map[string]interface{}{"name": "x", "count": int64(1)}, cache)
+		require.NoError(t, err)
+
+		_, populated := messagePool.Load(md)
+		assert.True(t, populated, "messagePool should have entry before cleanup")
+
+		cleanupMsgPool(md)
+
+		_, populated = messagePool.Load(md)
+		assert.False(t, populated, "messagePool should have no entry after cleanup")
+	})
+
+	t.Run("nested schema cleans sub-message entries", func(t *testing.T) {
+		schema := &storagepb.TableSchema{
+			Fields: []*storagepb.TableFieldSchema{
+				{
+					Name: "nested",
+					Type: storagepb.TableFieldSchema_STRUCT,
+					Mode: storagepb.TableFieldSchema_NULLABLE,
+					Fields: []*storagepb.TableFieldSchema{
+						{Name: "x", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+					},
+				},
+			},
+		}
+		md := buildMD(t, schema)
+		nestedMd := md.Fields().ByName("nested").Message()
+		cache := buildFieldLookupCache(md)
+
+		_, err := rawMapToBinary(md, map[interface{}]interface{}{
+			"nested": map[interface{}]interface{}{"x": []byte("hello")},
+		}, cache)
+		require.NoError(t, err)
+
+		_, topPopulated := messagePool.Load(md)
+		_, subPopulated := messagePool.Load(nestedMd)
+		assert.True(t, topPopulated, "top-level entry should exist before cleanup")
+		assert.True(t, subPopulated, "sub-message entry should exist before cleanup")
+
+		cleanupMsgPool(md)
+
+		_, topPopulated = messagePool.Load(md)
+		_, subPopulated = messagePool.Load(nestedMd)
+		assert.False(t, topPopulated, "top-level entry should be removed after cleanup")
+		assert.False(t, subPopulated, "sub-message entry should be removed after cleanup")
+	})
+}
+
 // BenchmarkRawMapToBinary benchmarks the raw map[interface{}]interface{} path.
 func BenchmarkRawMapToBinary(b *testing.B) {
 	schema := mangleInputSchema(&storagepb.TableSchema{
