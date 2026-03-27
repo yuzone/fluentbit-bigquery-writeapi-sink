@@ -64,6 +64,7 @@ type outputConfig struct {
 	timestampFields       []string
 	fieldCache            fieldLookupCache
 	flushTimeout          time.Duration
+	binaryData            [][]byte // reused across flushes to avoid per-flush allocation
 }
 
 var (
@@ -783,8 +784,12 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 	// Create Fluent Bit decoder
 	dec := newDecoder(data, int(length))
-	// Pre-allocate binaryData slice to reduce append-driven growth (#5)
-	binaryData := make([][]byte, 0, 256)
+	// Reuse binaryData slice across flushes to avoid per-flush allocation.
+	// Nil out retained elements before reset so GC can reclaim previous batch's bytes.
+	for i := range config.binaryData {
+		config.binaryData[i] = nil
+	}
+	binaryData := config.binaryData[:0]
 	var currsize int
 	// Keeps track of the number of rows previously sent
 	var rowCounter int64
@@ -824,7 +829,10 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 				rowCounter = 0
 
-				// Reuse the underlying array instead of nil to avoid re-allocation
+				// Nil out sent elements so GC can reclaim them, then reset slice.
+				for i := range binaryData {
+					binaryData[i] = nil
+				}
 				binaryData = binaryData[:0]
 				currsize = 0
 
@@ -849,6 +857,9 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		(*config.managedStreamSlice)[leastLoadedStreamIndex].offsetCounter += rowCounter
 		config.mutex.Unlock()
 	}
+
+	// Write back the grown slice so its capacity is reused on the next flush.
+	config.binaryData = binaryData
 
 	return output.FLB_OK
 }
