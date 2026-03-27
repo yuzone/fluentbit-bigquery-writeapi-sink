@@ -602,7 +602,12 @@ var newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder {
 // Mock it whenever needed
 var getFLBPluginContext = func(ctx unsafe.Pointer) int {
 	if ctx != nil {
-		return output.FLBPluginGetContext(ctx).(int)
+		id, ok := output.FLBPluginGetContext(ctx).(int)
+		if !ok {
+			log.Printf("FLBPluginGetContext returned unexpected type for context pointer %p", ctx)
+			return 0
+		}
+		return id
 	}
 	return 0
 }
