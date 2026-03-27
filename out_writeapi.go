@@ -21,6 +21,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -187,12 +188,23 @@ func getDescriptors(curr_ctx context.Context, mw_client ManagedWriterClient, pro
 // convertTimestampFieldsRaw converts timestamp fields in a raw Fluent Bit record
 // (map[interface{}]interface{}) from seconds to microseconds for BigQuery Storage Write API.
 // BigQuery TIMESTAMP type expects microseconds since Unix epoch.
+// Field paths may be dotted (e.g. "outer.inner") for nested RECORD fields.
 func convertTimestampFieldsRaw(data map[interface{}]interface{}, timestampFields []string) {
 	for _, field := range timestampFields {
-		// In Go, map[interface{}]interface{} lookup with a string key works
-		// because interface comparison uses underlying type+value equality.
-		if val, ok := data[field]; ok {
-			convertTimestampValueRaw(data, field, val)
+		if idx := strings.IndexByte(field, '.'); idx >= 0 {
+			// Nested path: navigate into the sub-map and recurse with the remainder.
+			parent, remainder := field[:idx], field[idx+1:]
+			if sub, ok := data[parent]; ok {
+				if subMap, ok := sub.(map[interface{}]interface{}); ok {
+					convertTimestampFieldsRaw(subMap, []string{remainder})
+				}
+			}
+		} else {
+			// In Go, map[interface{}]interface{} lookup with a string key works
+			// because interface comparison uses underlying type+value equality.
+			if val, ok := data[field]; ok {
+				convertTimestampValueRaw(data, field, val)
+			}
 		}
 	}
 }

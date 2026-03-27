@@ -1116,6 +1116,30 @@ func TestConvertTimestampFieldsRaw(t *testing.T) {
 			expected:        map[interface{}]interface{}{"time": int64(1700000000000000), "created_at": int64(1600000000000000)},
 		},
 		{
+			name: "nested RECORD timestamp field converted",
+			input: map[interface{}]interface{}{
+				"meta": map[interface{}]interface{}{
+					"ts": int64(1700000000),
+				},
+			},
+			timestampFields: []string{"meta.ts"},
+			expected: map[interface{}]interface{}{
+				"meta": map[interface{}]interface{}{
+					"ts": int64(1700000000000000),
+				},
+			},
+		},
+		{
+			name: "nested RECORD timestamp field missing parent not panic",
+			input: map[interface{}]interface{}{
+				"other": int64(1700000000),
+			},
+			timestampFields: []string{"meta.ts"},
+			expected: map[interface{}]interface{}{
+				"other": int64(1700000000),
+			},
+		},
+		{
 			name:            "field not present in data",
 			input:           map[interface{}]interface{}{"other": "value"},
 			timestampFields: []string{"time"},
