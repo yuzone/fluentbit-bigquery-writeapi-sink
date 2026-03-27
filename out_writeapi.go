@@ -459,11 +459,11 @@ func getInstanceCount() int {
 
 // Finds the stream index when dynamically scaling
 func getLeastLoadedStream(streamSlice *[]*streamConfig) int {
-	min := len(*(*streamSlice)[0].appendResults)
+	m := len(*(*streamSlice)[0].appendResults)
 	minStreamIndex := 0
 	for streamIndex, stream := range *streamSlice {
-		if len(*stream.appendResults) < min {
-			min = len(*stream.appendResults)
+		if len(*stream.appendResults) < m {
+			m = len(*stream.appendResults)
 			minStreamIndex = streamIndex
 		}
 	}
@@ -771,11 +771,6 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	// Keeps track of the number of rows previously sent
 	var rowCounter int64
 
-	// Find stream with least number of awaiting queue responses
-	config.mutex.Lock()
-	leastLoadedStreamIndex := getLeastLoadedStream(config.managedStreamSlice)
-	config.mutex.Unlock()
-
 	// Iterate Records
 	for {
 		// Extract Record
@@ -794,6 +789,11 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		} else {
 			// Successful data transformation
 			if (currsize + len(buf)) >= config.maxChunkSize {
+				// Re-evaluate the least loaded stream per chunk to distribute load across streams.
+				config.mutex.Lock()
+				leastLoadedStreamIndex := getLeastLoadedStream(config.managedStreamSlice)
+				config.mutex.Unlock()
+
 				// Appending Rows
 				err := sendRequest(ms_ctx, binaryData, &config, leastLoadedStreamIndex)
 				if err != nil {
@@ -817,6 +817,11 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 			rowCounter++
 		}
 	}
+	// Re-evaluate the least loaded stream for the final chunk.
+	config.mutex.Lock()
+	leastLoadedStreamIndex := getLeastLoadedStream(config.managedStreamSlice)
+	config.mutex.Unlock()
+
 	// Appending Rows
 	err := sendRequest(ms_ctx, binaryData, &config, leastLoadedStreamIndex)
 	if err != nil {
