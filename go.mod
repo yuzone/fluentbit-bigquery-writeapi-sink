@@ -7,7 +7,7 @@ toolchain go1.25.1
 require (
 	cloud.google.com/go v0.123.0
 	cloud.google.com/go/bigquery v1.74.0
-	github.com/agiledragon/gomonkey/v2 v2.13.0
+	github.com/agiledragon/gomonkey/v2 v2.14.0
 	github.com/fluent/fluent-bit-go v0.0.0-20260305090907-bda21e692da6
 	github.com/googleapis/gax-go/v2 v2.20.0
 	github.com/stretchr/testify v1.11.1
