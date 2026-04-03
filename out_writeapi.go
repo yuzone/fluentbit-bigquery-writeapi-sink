@@ -73,14 +73,14 @@ var (
 )
 
 const (
-	chunkSizeLimit             = 9 * 1024 * 1024 // BigQuery Storage Write API AppendRows hard limit (10MB minus overhead)
-	queueRequestDefault        = 1000             // default Max_Queue_Requests (max in-flight AppendRows per stream)
+	chunkSizeLimit             = 9 * 1024 * 1024   // BigQuery Storage Write API AppendRows hard limit (10MB minus overhead)
+	queueRequestDefault        = 1000              // default Max_Queue_Requests (max in-flight AppendRows per stream)
 	queueByteDefault           = 100 * 1024 * 1024 // default Max_Queue_Bytes: 100 MB
 	exactlyOnceDefault         = false
-	queueRequestScalingPercent = 0.8  // queue utilization threshold (80%) above which a new stream is created
+	queueRequestScalingPercent = 0.8 // queue utilization threshold (80%) above which a new stream is created
 	numRetriesDefault          = 4
-	maxNumStreamsPerInstance   = 10   // upper bound on dynamic stream count per output instance
-	minQueueRequests           = 10  // minimum Max_Queue_Requests accepted (prevents starvation during scaling)
+	maxNumStreamsPerInstance   = 10 // upper bound on dynamic stream count per output instance
+	minQueueRequests           = 10 // minimum Max_Queue_Requests accepted (prevents starvation during scaling)
 	dateTimeDefault            = true
 	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC; values above this are treated as already in microseconds
 	flushTimeoutSecDefault     = 10         // default Flush_Timeout_Sec: 10 seconds per flush call
@@ -406,7 +406,7 @@ func sendRequestExactlyOnce(ctx context.Context, data [][]byte, config *outputCo
 // The streamMu is held while closing and rebuilding the stream (rebuildPredicate path) so that no other
 // worker (workers > 1 scenario) can use the stream concurrently during the teardown/rebuild.
 // Note: this means network I/O (Finalize, Close, buildStream) runs under the lock on that path,
-// which is a known trade-off; see issue #12 in docs/code-analysis.md.
+// which is a known trade-off
 func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
 	retryer := newStatelessRetryer(config.numRetries)
 	attempt := 0
@@ -446,16 +446,18 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig
 
 // This function sends data and appends the responses to a queue to be checked asynchronously through a default stream with at least once functionality
 func sendRequestDefault(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
-	config.streamMu.Lock()
-	defer config.streamMu.Unlock()
-	currStream := (*config.managedStreamSlice)[streamIndex]
+	// Hold streamMu only for the slice access; AppendRows is goroutine-safe inside
+	// the managed writer and must not be called under the lock to avoid blocking all
+	// concurrent flushes when the inflight queue (Max_Queue_Requests / Max_Queue_Bytes)
+	// is saturated.
+	currStream := config.getStream(streamIndex)
 
 	appendResult, err := currStream.managedstream.AppendRows(ctx, data)
 	if err != nil {
 		return err
 	}
 
-	*currStream.appendResults = append(*currStream.appendResults, appendResult)
+	config.appendResult(currStream, appendResult)
 	return nil
 }
 
@@ -487,6 +489,28 @@ func getLeastLoadedStream(streamSlice *[]*streamConfig) int {
 		}
 	}
 	return minStreamIndex
+}
+
+// getStream returns the streamConfig at the given index, holding streamMu only
+// for the slice access so that the caller can invoke AppendRows without holding the lock.
+func (c *outputConfig) getStream(index int) *streamConfig {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	return (*c.managedStreamSlice)[index]
+}
+
+// appendResult appends an AppendResult to the stream's result queue under streamMu.
+func (c *outputConfig) appendResult(stream *streamConfig, result *managedwriter.AppendResult) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	*stream.appendResults = append(*stream.appendResults, result)
+}
+
+// leastLoadedStreamIndex returns the index of the least-loaded stream under streamMu.
+func (c *outputConfig) leastLoadedStreamIndex() int {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	return getLeastLoadedStream(c.managedStreamSlice)
 }
 
 // This is a test-only method which takes in a config id and returns the current offset value of the struct corresponding to the id
@@ -793,9 +817,7 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 // inside sendRequestExactlyOnce within the same streamMu critical section as the
 // AppendRows call, preventing TOCTOU races when workers > 1.
 func flushChunk(ctx context.Context, config *outputConfig, id int, binaryData [][]byte) {
-	config.streamMu.Lock()
-	streamIndex := getLeastLoadedStream(config.managedStreamSlice)
-	config.streamMu.Unlock()
+	streamIndex := config.leastLoadedStreamIndex()
 
 	if err := sendRequest(ctx, binaryData, config, streamIndex); err != nil {
 		log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
