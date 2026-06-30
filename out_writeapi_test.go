@@ -1303,3 +1303,123 @@ func TestConvertTimestampFieldsRaw(t *testing.T) {
 		})
 	}
 }
+
+// TestFLBPluginFlushCtxAppendUsesInstanceContext is a regression test for the bug where the
+// per-flush context was passed to AppendRows on the default (at-least-once) path. Because appends
+// are acknowledged asynchronously on a later flush, canceling the flush context at flush end aborted
+// the managed writer's internal retry/reconnect, turning transient connection failures into a
+// permanent failure storm. This test verifies that:
+//   - AppendRows receives the instance-scoped context (config.instanceCtx), not the flush context.
+//   - That context is NOT canceled after FLBPluginFlushCtx returns (when the flush context is canceled).
+//   - The instance-scoped context IS canceled after FLBPluginExitCtx.
+func TestFLBPluginFlushCtxAppendUsesInstanceContext(t *testing.T) {
+	var setID int
+
+	testTableSchema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "Text", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+
+	mockClient := &MockManagedWriterClient{
+		NewManagedStreamFunc: func(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error) {
+			return nil, nil
+		},
+		GetWriteStreamFunc: func(ctx context.Context, req *storagepb.GetWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error) {
+			return &storagepb.WriteStream{Name: "mockstream", TableSchema: testTableSchema}, nil
+		},
+		CloseFunc: func() error { return nil },
+	}
+
+	originalGetClient := getClient
+	getClient = func(ctx context.Context, projectID string) (ManagedWriterClient, error) {
+		return mockClient, nil
+	}
+	defer func() { getClient = originalGetClient }()
+
+	// Capture the context that AppendRows is invoked with.
+	var capturedCtx context.Context
+	mockMS := &MockManagedStream{
+		AppendRowsFunc: func(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error) {
+			capturedCtx = ctx
+			return nil, nil // nil AppendResult queued; drained via mocked pluginGetResult at exit
+		},
+		CloseFunc: func() error { return nil },
+		FinalizeFunc: func(ctx context.Context, opts ...gax.CallOption) (int64, error) {
+			return 0, nil
+		},
+		FlushRowsFunc: func(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error) {
+			return 0, nil
+		},
+		StreamNameFunc: func() string { return "" },
+	}
+
+	origGetWriter := getWriter
+	getWriter = func(client ManagedWriterClient, ctx context.Context, projectID string, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
+		return mockMS, nil
+	}
+	defer func() { getWriter = origGetWriter }()
+
+	patch1 := gomonkey.ApplyFunc(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+		return ""
+	})
+	defer patch1.Reset()
+
+	patchSetContext := gomonkey.ApplyFunc(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+		setID = ctx.(int)
+	})
+	defer patchSetContext.Reset()
+
+	initRes := FLBPluginInit(nil)
+	assert.Equal(t, output.FLB_OK, initRes)
+
+	origGetContext := getFLBPluginContext
+	getFLBPluginContext = func(ctx unsafe.Pointer) int {
+		if ctx != nil {
+			return *(*int)(ctx)
+		}
+		return 0
+	}
+	defer func() { getFLBPluginContext = origGetContext }()
+
+	// Keep queued responses "in-flight" so the flush does not try to drain them.
+	origIsReady := isReady
+	isReady = func(_ *managedwriter.AppendResult) bool { return false }
+	defer func() { isReady = origIsReady }()
+
+	// Avoid dereferencing the nil AppendResult during the exit drain.
+	origGetResult := pluginGetResult
+	pluginGetResult = func(_ *managedwriter.AppendResult, _ context.Context) (int64, error) {
+		return -1, nil
+	}
+	defer func() { pluginGetResult = origGetResult }()
+
+	origDecoder := newDecoder
+	newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder { return nil }
+	defer func() { newDecoder = origDecoder }()
+
+	var rowSent bool
+	patchRecord := gomonkey.ApplyFunc(output.GetRecord, func(dec *output.FLBDecoder) (int, interface{}, map[interface{}]interface{}) {
+		if !rowSent {
+			rowSent = true
+			return 0, nil, map[interface{}]interface{}{"Text": []byte("hello")}
+		}
+		return 1, nil, nil
+	})
+	defer patchRecord.Reset()
+
+	pointerValue := unsafe.Pointer(&setID)
+	flushResult := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
+	assert.Equal(t, output.FLB_OK, flushResult)
+
+	// The per-flush context is canceled when FLBPluginFlushCtx returns. The append must have
+	// received the instance-scoped context, which stays alive until FLBPluginExitCtx.
+	assert.NotNil(t, capturedCtx, "AppendRows should have been called")
+	assert.NoError(t, capturedCtx.Err(), "AppendRows context must not be canceled after the flush returns")
+	assert.Equal(t, configMap[setID].instanceCtx, capturedCtx, "AppendRows must use the instance-scoped context")
+
+	// After exit, the instance-scoped context is canceled.
+	exitResult := FLBPluginExitCtx(pointerValue)
+	assert.Equal(t, output.FLB_OK, exitResult)
+	assert.Error(t, capturedCtx.Err(), "instance-scoped context must be canceled after exit")
+}

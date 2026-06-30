@@ -65,6 +65,13 @@ type outputConfig struct {
 	timestampFields       []string
 	fieldCache            fieldLookupCache
 	flushTimeout          time.Duration
+	// instanceCtx is a long-lived context, scoped to the lifetime of the output instance,
+	// used for AppendRows and managed stream creation. Unlike the per-flush context, it is not
+	// canceled at the end of a flush, so the managed writer's internal retry/reconnect logic for
+	// asynchronously-acknowledged appends (default/at-least-once path) is not aborted prematurely.
+	// It is canceled in FLBPluginExitCtx after pending responses are drained and streams are closed.
+	instanceCtx    context.Context
+	instanceCancel context.CancelFunc
 }
 
 var (
@@ -424,7 +431,7 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig
 			currStream.managedstream.Finalize(ctx)
 			currStream.managedstream.Close()
 			// Rebuild stream
-			buildErr := buildStream(ctx, config, streamIndex)
+			buildErr := buildStream(config.instanceCtx, config, streamIndex)
 			config.streamMu.Unlock()
 			if buildErr != nil {
 				return buildErr
@@ -444,7 +451,13 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config *outputConfig
 	return nil
 }
 
-// This function sends data and appends the responses to a queue to be checked asynchronously through a default stream with at least once functionality
+// This function sends data and appends the responses to a queue to be checked asynchronously through a default stream with at least once functionality.
+// The ctx parameter is retained for signature symmetry with sendRequestRetries (both are dispatched
+// from sendRequest); it is intentionally not used for the append itself. The append uses the
+// instance-scoped context instead. Note that because instanceCtx has no per-append deadline, the
+// only backpressure bound is the managed writer's inflight limit (Max_Queue_Requests /
+// Max_Queue_Bytes); on saturation AppendRows blocks rather than timing out, which surfaces as a
+// blocking flush absorbed by Fluent Bit's (filesystem) buffer.
 func sendRequestDefault(ctx context.Context, data [][]byte, config *outputConfig, streamIndex int) error {
 	// Hold streamMu only for the slice access; AppendRows is goroutine-safe inside
 	// the managed writer and must not be called under the lock to avoid blocking all
@@ -452,7 +465,10 @@ func sendRequestDefault(ctx context.Context, data [][]byte, config *outputConfig
 	// is saturated.
 	currStream := config.getStream(streamIndex)
 
-	appendResult, err := currStream.managedstream.AppendRows(ctx, data)
+	// Use the instance-scoped context (not the per-flush ctx) so that the managed writer's
+	// internal retry/reconnect for this asynchronously-acknowledged append is not aborted
+	// when the originating flush's context is canceled at flush end.
+	appendResult, err := currStream.managedstream.AppendRows(config.instanceCtx, data)
 	if err != nil {
 		return err
 	}
@@ -536,8 +552,10 @@ var setThreshold = func(maxQueueSize int) int {
 }
 
 // This function check whether there is room for scaling and the scales the number of stream dynamically depending on if it
-// Detects back pressure from the queue
-func createNewStreamDynamicScaling(ctx context.Context, config *outputConfig) {
+// Detects back pressure from the queue.
+// It uses config.instanceCtx (not a per-flush context) for stream creation so that the new stream's
+// lifetime is not tied to the flush that triggered the scaling.
+func createNewStreamDynamicScaling(config *outputConfig) {
 	config.streamMu.Lock()
 	defer config.streamMu.Unlock()
 	if len(*config.managedStreamSlice) < maxNumStreamsPerInstance {
@@ -554,7 +572,10 @@ func createNewStreamDynamicScaling(ctx context.Context, config *outputConfig) {
 		if mostEfficientQueueLength > config.requestCountThreshold {
 			*config.managedStreamSlice = append(*config.managedStreamSlice, &newStream)
 			newStreamIndex := len(*config.managedStreamSlice) - 1
-			err := buildStream(ctx, config, newStreamIndex)
+			// Use the instance-scoped context so the newly created stream's lifetime is not tied
+			// to the per-flush context (which is canceled at flush end and would otherwise
+			// terminalize the new managed stream immediately).
+			err := buildStream(config.instanceCtx, config, newStreamIndex)
 			if err != nil {
 				log.Printf("Creating an additional managed stream with destination table: %s failed in FLBPluginInit: %s", config.tableRef, err)
 				// If failure, failed stream is removed from slice
@@ -731,9 +752,13 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	}
 
 	// Create new client
-	initCtx := context.Background()
-	client, err := getClient(initCtx, projectID)
+	// Create an instance-scoped context that outlives individual flush calls. Using it for client
+	// creation, stream creation (buildStream) and AppendRows ensures the managed writer's internal
+	// retry/reconnect logic is not aborted when a per-flush context is canceled at flush end.
+	instanceCtx, instanceCancel := context.WithCancel(context.Background())
+	client, err := getClient(instanceCtx, projectID)
 	if err != nil {
+		instanceCancel()
 		log.Printf("Creating a new managed BigQuery Storage write client scoped to: %s failed in FLBPluginInit: %s", projectID, err)
 		return output.FLB_ERROR
 	}
@@ -742,8 +767,9 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	tableReference := fmt.Sprintf("projects/%s/datasets/%s/tables/%s", projectID, datasetID, tableID)
 
 	// Call getDescriptors to get the message descriptor, and descriptor proto
-	md, descriptor, timestampFields, err := getDescriptors(initCtx, client, projectID, datasetID, tableID, dateTimeStringType)
+	md, descriptor, timestampFields, err := getDescriptors(instanceCtx, client, projectID, datasetID, tableID, dateTimeStringType)
 	if err != nil {
+		instanceCancel()
 		log.Printf("Getting message descriptor and descriptor proto for table: %s failed in FLBPluginInit: %s", tableReference, err)
 		return output.FLB_ERROR
 	}
@@ -788,11 +814,14 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		timestampFields:       timestampFields,
 		fieldCache:            buildFieldLookupCache(md),
 		flushTimeout:          time.Duration(flushTimeoutSec) * time.Second,
+		instanceCtx:           instanceCtx,
+		instanceCancel:        instanceCancel,
 	}
 
 	// Create stream using NewManagedStream
-	err = buildStream(initCtx, &config, 0)
+	err = buildStream(instanceCtx, &config, 0)
 	if err != nil {
+		instanceCancel()
 		log.Printf("Creating a new managed stream with destination table: %s failed in FLBPluginInit: %s", tableReference, err)
 		return output.FLB_ERROR
 	}
@@ -877,7 +906,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 	// Drain ready responses and check whether a new stream should be created.
 	checkAllStreamResponses(flushCtx, &config.managedStreamSlice, false, &config.streamMu, config.exactlyOnce, id)
-	createNewStreamDynamicScaling(flushCtx, config)
+	createNewStreamDynamicScaling(config)
 
 	// binaryData is a flush-local buffer. Each worker (workers > 1) gets its own
 	// stack frame, so there is no shared state and no mutex needed here.
@@ -923,6 +952,13 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 			log.Printf("Closing managed writer client for output instance with id: %d failed in FLBPluginExitCtx: %s", id, err)
 			errFlag = true
 		}
+	}
+
+	// Cancel the instance-scoped context only after pending responses are drained and the streams
+	// and client are closed, so that in-flight AppendRows are not aborted prematurely (which would
+	// cause data loss and terminalize the streams during shutdown).
+	if config.instanceCancel != nil {
+		config.instanceCancel()
 	}
 
 	if errFlag {
