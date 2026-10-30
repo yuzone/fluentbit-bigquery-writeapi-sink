@@ -665,22 +665,20 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 
 	// Creates new stream with a mock buildStream function to count the number of times we scale up
 	origBuildStream := buildStream
-	buildStream = func(ctx context.Context, config *outputConfig, streamIndex int) error {
+	buildStream = func(ctx context.Context, tw *tableWriter, streamIndex int) error {
 		checks.buildStreamCalled++
-		currManagedStream, err := getWriter(config.client, ctx, config.currProjectID,
-			managedwriter.WithType(config.streamType),
-			managedwriter.WithDestinationTable(config.tableRef),
+		currManagedStream, err := getWriter(tw.client, ctx, tw.cfg.projectID,
+			managedwriter.WithType(tw.cfg.streamType),
+			managedwriter.WithDestinationTable(tw.tableRef),
 			// Use the descriptor proto when creating the new managed stream
-			managedwriter.WithSchemaDescriptor(config.schemaDesc),
-			managedwriter.EnableWriteRetries(config.enableRetry),
-			managedwriter.WithMaxInflightBytes(config.maxQueueBytes),
-			managedwriter.WithMaxInflightRequests(config.maxQueueRequests),
+			managedwriter.WithSchemaDescriptor(tw.schemaDesc),
+			managedwriter.EnableWriteRetries(tw.cfg.enableRetry),
+			managedwriter.WithMaxInflightBytes(tw.cfg.maxQueueBytes),
+			managedwriter.WithMaxInflightRequests(tw.cfg.maxQueueRequests),
 		)
 
-		streamSlice := *config.managedStreamSlice
-
 		if err == nil {
-			(streamSlice)[streamIndex].managedstream = currManagedStream
+			tw.streams[streamIndex].managedstream = currManagedStream
 		}
 		return nil
 	}
