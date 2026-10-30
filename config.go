@@ -175,6 +175,8 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 		cfg.maxChunkSize = chunkSizeLimit
 	}
 
+	// Max_Queue_Requests / Max_Queue_Bytes <= 0 disable the respective in-flight limit in the
+	// managed writer (its flow controller only creates a semaphore for positive values).
 	if cfg.maxQueueRequests, err = getConfigField(flb, plugin, "Max_Queue_Requests", queueRequestDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Max_Queue_Requests parameter in configuration file: %w", err)
 	}
@@ -185,12 +187,15 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 	}
 
 	if cfg.dateTimeStringType, err = getConfigField(flb, plugin, "DateTime_String_Type", dateTimeDefault); err != nil {
-		return nil, fmt.Errorf("Invalid DateTime_Input_Type parameter in configuration file: %w", err)
+		return nil, fmt.Errorf("Invalid DateTime_String_Type parameter in configuration file: %w", err)
 	}
 
 	flushTimeoutSec, err := getConfigField(flb, plugin, "Flush_Timeout_Sec", flushTimeoutSecDefault)
 	if err != nil {
 		return nil, fmt.Errorf("Invalid Flush_Timeout_Sec parameter in configuration file: %w", err)
+	}
+	if flushTimeoutSec < 1 {
+		return nil, fmt.Errorf("Invalid Flush_Timeout_Sec parameter in configuration file: must be >= 1, got %d", flushTimeoutSec)
 	}
 	cfg.flushTimeout = time.Duration(flushTimeoutSec) * time.Second
 

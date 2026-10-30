@@ -112,11 +112,11 @@ Keys are matched case-insensitively by Fluent Bit.
 | `Unknown_Table_Action` | string | `drop` | What to do with a chunk whose table cannot be resolved or initialised: `drop` logs and acknowledges the chunk (`FLB_OK`); `retry` returns `FLB_RETRY` so Fluent Bit redelivers it. A **transient** initialisation failure (backend unreachable, `Init_Timeout_Sec` exceeded) is not an unknown table: it is retried like a transient append failure regardless of this setting. A tag that cannot be mapped to a table at all (`$TAG[n]` out of range, invalid dataset/table ID) is always dropped, because redelivering the same tag could never succeed. |
 | `Exactly_Once` | bool | `false` | `true` uses a committed stream with synchronous response checking (exactly-once). `false` uses the default stream with asynchronous response checking (at-least-once). |
 | `Num_Synchronous_Retries` | int | `4` | Maximum synchronous retries per append when `Exactly_Once` is `true`. Ignored otherwise. |
-| `Max_Chunk_Size` | int (bytes) | `9437184` (9 MiB) | Upper bound on the serialized size of a single `AppendRows` request. Values above 9 MiB are clamped to 9 MiB. |
-| `Max_Queue_Requests` | int | `1000` | Maximum number of in-flight (unacknowledged) `AppendRows` requests per stream. When the queue reaches 80 % of this value a new default stream is created (up to 10 streams per output instance). |
-| `Max_Queue_Bytes` | int (bytes) | `104857600` (100 MiB) | Maximum number of in-flight bytes per stream. |
+| `Max_Chunk_Size` | int (bytes) | `9437184` (9 MiB) | Upper bound on the serialized size of a single `AppendRows` request. Values above 9 MiB are clamped to 9 MiB. A single row larger than this bound is still sent on its own; a row whose serialized size alone reaches 9 MiB can never be sent and is logged and skipped (see [Delivery semantics](#delivery-semantics)). |
+| `Max_Queue_Requests` | int | `1000` | Maximum number of in-flight (unacknowledged) `AppendRows` requests per stream. When the queue reaches 80 % of this value a new default stream is created (up to 10 streams per output instance). `0` or a negative value disables the limit. |
+| `Max_Queue_Bytes` | int (bytes) | `104857600` (100 MiB) | Maximum number of in-flight bytes per stream. `0` or a negative value disables the limit. |
 | `DateTime_String_Type` | bool | `true` | `true` accepts `DATETIME` values as strings. `false` accepts civil-time encoded `int64`. Applies to nested `DATETIME` fields as well; `RANGE<DATETIME>` always expects `int64`. |
-| `Flush_Timeout_Sec` | int (seconds) | `10` | Deadline for a single flush call (and for each step of the shutdown, see [Shutdown](#shutdown)). An `AppendRows` call that has not returned by then is left running in the background and the chunk is reported as `FLB_RETRY` (see [Delivery semantics](#delivery-semantics)). |
+| `Flush_Timeout_Sec` | int (seconds) | `10` | Deadline for a single flush call (and for each step of the shutdown, see [Shutdown](#shutdown)). An `AppendRows` call that has not returned by then is left running in the background and the chunk is reported as `FLB_RETRY` (see [Delivery semantics](#delivery-semantics)). Must be ≥ 1. |
 | `Init_Timeout_Sec` | int (seconds) | `30` | Deadline for initialising one table (schema fetch and stream creation). Without it the client library retries an unreachable backend for 10 minutes, blocking Fluent Bit's start-up (static table) or the first flush of a tag-routed table. Must be ≥ 1. |
 | `Retry_On_Failure` | bool | `true` | `true` returns `FLB_RETRY` / `FLB_ERROR` to Fluent Bit when an append fails (see [Delivery semantics](#delivery-semantics)). `false` restores the historical behaviour of logging the failure and acknowledging the chunk. |
 | `Enable_Multiplexing` | bool | `false` | **EXPERIMENTAL.** Share gRPC connections between default streams of this output (see [Connection multiplexing](#connection-multiplexing)). |
@@ -203,8 +203,8 @@ Fluent Bit return codes:
 | Code | When | Fluent Bit reaction |
 |---|---|---|
 | `FLB_OK` | Every `AppendRows` call of the chunk was accepted (or handed to the default stream). Also returned when `Retry_On_Failure` is `false`, for unknown tables with `Unknown_Table_Action drop`, and for tags that cannot be mapped to a table (logged and dropped regardless of `Unknown_Table_Action`). | Chunk is acknowledged and released. |
-| `FLB_RETRY` | A **transient** failure: gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`, `INTERNAL`, `CANCELLED`, connection errors, `io.EOF`, context deadline/cancellation. Also returned for unknown tables with `Unknown_Table_Action retry`. | Chunk is kept in the buffer and redelivered according to `Retry_Limit` / `scheduler.*`. |
-| `FLB_ERROR` | A **permanent** failure: `INVALID_ARGUMENT` (for example schema mismatch), `PERMISSION_DENIED`, `NOT_FOUND`, and any other error. | Chunk is dropped and counted in the output's error metrics. |
+| `FLB_RETRY` | A **transient** failure: gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`, `INTERNAL`, `CANCELLED`, `UNAUTHENTICATED` (a failed token refresh; a permanently invalid credential therefore keeps being retried up to `Retry_Limit`, like an outage), connection errors, `io.EOF`, context deadline/cancellation. Also returned for unknown tables with `Unknown_Table_Action retry`. | Chunk is kept in the buffer and redelivered according to `Retry_Limit` / `scheduler.*`. |
+| `FLB_ERROR` | A **permanent** failure: `INVALID_ARGUMENT` (for example schema mismatch), `PERMISSION_DENIED`, `NOT_FOUND`, `FAILED_PRECONDITION`, and any other error. | Chunk is dropped and counted in the output's error metrics. |
 
 Which failures are visible at flush time depends on the mode:
 
@@ -232,7 +232,10 @@ Which failures are visible at flush time depends on the mode:
   way (`FLB_RETRY`, not `Unknown_Table_Action`).
 - **Committed stream (`Exactly_Once true`)**: every append is confirmed
   synchronously and retried up to `Num_Synchronous_Retries` times for
-  transient errors before the chunk is reported as `FLB_RETRY`. If the server
+  transient errors before the chunk is reported as `FLB_RETRY`. The same
+  classification as in the table above decides both the synchronous retry and
+  the return code, so a permanent failure is reported as `FLB_ERROR` without
+  any synchronous retry. If the server
   response has not arrived within `Flush_Timeout_Sec`, the rows are usually
   committed at the offset that was used, so the append is handled like a
   blocked one: the chunk is reported as `FLB_RETRY`, flushes for that table
@@ -260,7 +263,12 @@ remaining requests.
 
 Records that cannot be converted to the table schema on the client side are
 logged and skipped individually; retrying would not help, so they never
-influence the return code.
+influence the return code. The same applies to a single row whose serialized
+size alone reaches the 9 MiB `AppendRows` bound (it could never be sent, and
+sending it would fail the whole chunk with `INVALID_ARGUMENT`), and to
+malformed records in the chunk (msgpack objects that are not a
+`[timestamp, map]` pair): they are counted, logged once per flush and skipped,
+while the records after them are still delivered.
 
 ## Shutdown
 

@@ -203,18 +203,37 @@ func flushChunk(ctx context.Context, tw *tableWriter, id int, binaryData [][]byt
 // reaches maxChunkSize, it calls flushChunk and resets binaryData
 // (preserving capacity for reuse). It returns the remaining (unsent) binaryData,
 // or nil when a transient failure aborted the chunk.
+//
+// Records that cannot be used are skipped individually and never influence the return code:
+// malformed records (not a [timestamp, map] pair), records that cannot be serialized against
+// the table schema, and rows whose serialized size alone reaches chunkSizeLimit (such a row
+// could never fit into one AppendRows call, so sending it would fail the whole chunk with
+// INVALID_ARGUMENT).
 func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, maxChunkSize int, dec *output.FLBDecoder, binaryData [][]byte, outcome *flushOutcome) [][]byte {
 	var currsize int
+	var malformed int
 
 	for {
 		ret, _, record := output.GetRecord(dec)
-		if ret != 0 {
+		if ret == -1 {
+			// End of data, or a msgpack object the decoder could not decode (it cannot resync
+			// past it, so the rest of the chunk is unreadable either way).
 			break
+		}
+		if ret != 0 {
+			// The object was decoded but is not a log record; the decoder has consumed it and
+			// the next one can be read.
+			malformed++
+			continue
 		}
 
 		buf, err := tw.serializeRecord(record)
 		if err != nil {
 			log.Printf("Transforming row with value:%v from map to binary data for output instance with id: %d failed in FLBPluginFlushCtx: %s", record, id, err)
+			continue
+		}
+		if len(buf) >= chunkSizeLimit {
+			log.Printf("Skipping row of %d bytes for output instance with id: %d in FLBPluginFlushCtx: a single row cannot exceed the %d byte AppendRows limit", len(buf), id, chunkSizeLimit)
 			continue
 		}
 
@@ -235,6 +254,9 @@ func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, max
 		currsize += (len(buf) + 2)
 	}
 
+	if malformed > 0 {
+		log.Printf("Skipped %d malformed record(s) for output instance with id: %d in FLBPluginFlushCtx: not a [timestamp, map] pair", malformed, id)
+	}
 	return binaryData
 }
 

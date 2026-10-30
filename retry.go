@@ -20,7 +20,6 @@ import (
 	"io"
 	"math/rand"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,11 +27,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// isTransientError classifies an AppendRows / GetResult failure for FLBPluginFlushCtx.
-// Transient errors (connectivity, deadlines, server-side throttling or hiccups) are worth
-// asking Fluent Bit to redeliver the chunk; everything else (INVALID_ARGUMENT,
-// PERMISSION_DENIED, NOT_FOUND, schema/row errors, ...) is permanent and retrying would
-// not help.
+// isTransientError classifies an AppendRows / GetResult failure. It is the single predicate
+// behind both retry decisions of the plugin: the synchronous retries of the committed-stream
+// path (statelessRetryer) and the FLB_RETRY / FLB_ERROR return code of FLBPluginFlushCtx.
+// Transient errors (connectivity, deadlines, server-side throttling or hiccups, token refresh
+// failures) are worth retrying and asking Fluent Bit to redeliver the chunk; everything else
+// (INVALID_ARGUMENT, PERMISSION_DENIED, NOT_FOUND, FAILED_PRECONDITION, schema/row errors, ...)
+// is permanent and retrying would not help.
 func isTransientError(err error) bool {
 	if err == nil {
 		return false
@@ -53,54 +54,18 @@ func isTransientError(err error) bool {
 			codes.ResourceExhausted,
 			codes.Aborted,
 			codes.Internal,
-			codes.Canceled:
+			codes.Canceled,
+			codes.Unauthenticated:
 			return true
 		}
 	}
 	return false
 }
 
-// This retry predicate is used for higher level retries, enqueing appends onto to a bidi
-// Channel and evaluating whether an append should be retried (re-enqueued).
-func retryPredicate(err error) (shouldRetry bool) {
-	if err == nil {
-		return
-	}
-
-	s, ok := status.FromError(err)
-	// Non-status based error conditions.
-	if !ok {
-		// EOF can happen in the case of connection close.
-		if errors.Is(err, io.EOF) {
-			shouldRetry = true
-			return
-		}
-		// All other non-status errors are treated as non-retryable (including context errors).
-		return
-	}
-	switch s.Code() {
-	case codes.Aborted,
-		codes.Canceled,
-		codes.DeadlineExceeded,
-		codes.FailedPrecondition,
-		codes.Internal,
-		codes.Unavailable:
-		shouldRetry = true
-		return
-	case codes.ResourceExhausted:
-		if strings.HasPrefix(s.Message(), "Exceeds 'AppendRows throughput' quota") {
-			// Note: internal b/246031522 opened to give this a structured error
-			// And avoid string parsing.  Should be a QuotaFailure or similar.
-			shouldRetry = true
-			return
-		}
-	}
-	return
-}
-
-// StatelessRetryer is used for backing off within a continuous process, like processing the responses
-// From the receive side of the bidi stream.  An individual item in that process has a notion of an attempt
-// Count, and we use maximum retries as a way of evicting bad items.
+// statelessRetryer decides whether a failed synchronous append (committed stream) is retried
+// within the same flush and how long to pause before the next attempt. Only transient errors
+// (isTransientError) are retried, so an append that exhausts its attempts is reported as
+// FLB_RETRY and one that fails permanently is reported as FLB_ERROR right away.
 type statelessRetryer struct {
 	mu sync.Mutex // guards r
 	r  *rand.Rand
@@ -135,8 +100,7 @@ func (sr *statelessRetryer) Retry(err error, attemptCount int) (time.Duration, b
 	if attemptCount >= sr.maxAttempts {
 		return 0, false
 	}
-	shouldRetry := retryPredicate(err)
-	if shouldRetry {
+	if isTransientError(err) {
 		return sr.pause(), true
 	}
 	return 0, false

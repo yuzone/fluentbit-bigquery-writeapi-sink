@@ -23,9 +23,13 @@ import (
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
 	"github.com/fluent/fluent-bit-go/output"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 func TestParseTagTemplateRender(t *testing.T) {
@@ -162,6 +166,22 @@ func (f *routerFixture) onAppend(fn func(ctx context.Context, data [][]byte) (ap
 }
 
 func (f *routerFixture) appendCalls() int32 { return f.stream.appends.Load() }
+
+// textValues decodes appended rows against the fixture's single-field schema and returns the
+// Text column of each row in order.
+func (f *routerFixture) textValues(t *testing.T, rows [][]byte) []string {
+	t.Helper()
+	descriptor, err := adapt.StorageSchemaToProto2Descriptor(f.client.schema, "root")
+	require.NoError(t, err)
+	md := descriptor.(protoreflect.MessageDescriptor)
+	values := make([]string, 0, len(rows))
+	for _, row := range rows {
+		m := dynamicpb.NewMessage(md)
+		require.NoError(t, proto.Unmarshal(row, m))
+		values = append(values, m.Get(md.Fields().ByName("Text")).String())
+	}
+	return values
+}
 
 func streamName(dataset, table string) string {
 	return "projects/p/datasets/" + dataset + "/tables/" + table + "/streams/_default"

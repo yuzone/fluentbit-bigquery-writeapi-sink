@@ -554,6 +554,9 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 }
 
 // sendRequestRetries enables synchronous retries and rebuilding a valid stream based on the server response.
+// Transient failures (isTransientError, the same classification that decides FLB_RETRY vs
+// FLB_ERROR) are retried up to cfg.numRetries times with a short backoff; permanent ones are
+// returned at once.
 // An append rejected with a StorageError recognised by rebuildPredicate (INVALID_STREAM_TYPE,
 // OFFSET_ALREADY_EXISTS, OFFSET_OUT_OF_RANGE), or made while the stream has no usable managed
 // stream, triggers rebuildStream and is retried once on the new stream without counting as an
@@ -588,6 +591,11 @@ func (tw *tableWriter) sendRequestRetries(ctx context.Context, data [][]byte, st
 		} else {
 			backoffPeriod, shouldRetry := retryer.Retry(err, attempt)
 			if !shouldRetry {
+				return err
+			}
+			// A done context is classified as transient but cannot be recovered by retrying
+			// within this flush: another attempt would fail at once after a pointless pause.
+			if ctx.Err() != nil || tw.ctx.Err() != nil {
 				return err
 			}
 			// Retry sending data after incrementing attempt count and waiting for designated amount of time
