@@ -57,7 +57,7 @@ jobs:
           cp out/${{ matrix.arch }}/out_writeapi.so \
             dist/out_writeapi-${{ needs.prepare.outputs.version }}-linux-${{ matrix.arch }}.so
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.arch }}
           path: dist/*.so
