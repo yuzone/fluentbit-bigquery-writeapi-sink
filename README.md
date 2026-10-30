@@ -280,7 +280,10 @@ shutdown takes well under a second per output.
 ## Backpressure and buffering
 
 When the in-flight queue of a default stream fills up (see
-`Max_Queue_Requests`) the plugin opens additional streams. In practice this only
+`Max_Queue_Requests`) the plugin opens additional streams. The new stream is
+created in the background (one at a time per table): flushes keep using the
+existing streams meanwhile and never wait for it, even when the backend is slow
+and the creation takes up to `Init_Timeout_Sec`. In practice scaling only
 happens for default streams; with `Exactly_Once` every append is acknowledged
 synchronously, so the queue never grows beyond a single flush.
 

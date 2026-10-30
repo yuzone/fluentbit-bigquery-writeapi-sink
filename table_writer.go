@@ -58,8 +58,14 @@ type tableWriter struct {
 	timestampFields   []string
 	fieldCache        fieldLookupCache
 
-	streamMu sync.Mutex // guards streams and its elements (streamConfig)
+	streamMu sync.Mutex // guards streams and its elements (streamConfig), scaling and closed
 	streams  []*streamConfig
+	// scaling is set while maybeScale is creating an additional stream in the background,
+	// so that concurrent flushes do not start a second one.
+	scaling bool
+	// closed is set by close. A stream whose creation completes afterwards is closed
+	// instead of being added, so that it does not leak.
+	closed bool
 
 	// blockedAppends counts AppendRows calls that did not return within the flush timeout and
 	// are still running in the background (see appendRows). While it is non-zero every flush
@@ -349,12 +355,24 @@ func (tw *tableWriter) drainResponses(ctx context.Context, waitForResponse bool)
 	}
 }
 
-// buildStream creates the managed stream at streamIndex. NewManagedStream performs unary RPCs
-// (GetWriteStream, plus CreateWriteStream for committed streams) that retry for minutes by
-// default. The call is bounded by cfg.initTimeout; ctx itself cannot carry the deadline
-// because the stream retains it for its whole lifetime. A stream that is created after the
-// deadline is closed so that it does not leak.
+// buildStream creates the managed stream at streamIndex. Caller must hold tw.streamMu unless
+// no other goroutine can reach tw.streams yet (newTableWriter).
 func (tw *tableWriter) buildStream(ctx context.Context, streamIndex int) error {
+	ms, err := tw.newManagedStream(ctx)
+	if err != nil {
+		return err
+	}
+	tw.streams[streamIndex].managedstream = ms
+	return nil
+}
+
+// newManagedStream creates a managed stream for this table. NewManagedStream performs unary
+// RPCs (GetWriteStream, plus CreateWriteStream for committed streams) that retry for minutes
+// by default. The call is bounded by cfg.initTimeout; ctx itself cannot carry the deadline
+// because the stream retains it for its whole lifetime. A stream that is created after the
+// deadline is closed so that it does not leak. It does not touch tw.streams and may be called
+// without holding streamMu.
+func (tw *tableWriter) newManagedStream(ctx context.Context) (MWManagedStream, error) {
 	type created struct {
 		ms  MWManagedStream
 		err error
@@ -379,17 +397,14 @@ func (tw *tableWriter) buildStream(ctx context.Context, streamIndex int) error {
 	defer timer.Stop()
 	select {
 	case c := <-done:
-		if c.err == nil {
-			tw.streams[streamIndex].managedstream = c.ms
-		}
-		return c.err
+		return c.ms, c.err
 	case <-timer.C:
 		go func() {
 			if c := <-done; c.err == nil {
 				c.ms.Close()
 			}
 		}()
-		return fmt.Errorf("stream creation did not complete within %s: %w", tw.cfg.initTimeout, context.DeadlineExceeded)
+		return nil, fmt.Errorf("stream creation did not complete within %s: %w", tw.cfg.initTimeout, context.DeadlineExceeded)
 	}
 }
 
@@ -629,29 +644,45 @@ func requestCountThreshold(maxQueueSize int) int {
 	return requestCountThreshold
 }
 
-// maybeScale checks whether there is room for scaling and adds a stream when it detects back
-// pressure from the queue. It uses tw.ctx (not a per-flush context) for stream creation so that
-// the new stream's lifetime is not tied to the flush that triggered the scaling.
+// maybeScale checks whether there is room for scaling and, when it detects back pressure from
+// the queue, starts creating an additional stream in the background. Stream creation can take
+// up to cfg.initTimeout while the backend is degraded, so it must not run under streamMu (every
+// flush of this table needs the lock) nor in the calling flush (which is bounded by
+// Flush_Timeout_Sec). The scaling flag keeps concurrent flushes from starting a second one.
 func (tw *tableWriter) maybeScale() {
 	tw.streamMu.Lock()
 	defer tw.streamMu.Unlock()
-	if len(tw.streams) >= maxNumStreamsPerInstance {
+	if tw.scaling || tw.closed || len(tw.streams) >= maxNumStreamsPerInstance {
 		return
 	}
 	// Gets stream with least values in queue
 	mostEfficient := getLeastLoadedStream(tw.streams)
-	mostEfficientQueueLength := len(tw.streams[mostEfficient].appendResults)
-
-	if mostEfficientQueueLength > tw.cfg.requestCountThreshold {
-		tw.streams = append(tw.streams, &streamConfig{})
-		newStreamIndex := len(tw.streams) - 1
-		err := tw.buildStream(tw.ctx, newStreamIndex)
-		if err != nil {
-			log.Printf("Creating an additional managed stream with destination table: %s failed in FLBPluginInit: %s", tw.tableRef, err)
-			// If failure, failed stream is removed from slice
-			tw.streams = tw.streams[:newStreamIndex]
-		}
+	if len(tw.streams[mostEfficient].appendResults) <= tw.cfg.requestCountThreshold {
+		return
 	}
+	tw.scaling = true
+	go tw.addStream()
+}
+
+// addStream creates one more managed stream and adds it to tw.streams. It uses tw.ctx (not a
+// per-flush context) so that the new stream's lifetime is not tied to the flush that triggered
+// the scaling. Caller must have set tw.scaling; it is cleared here.
+func (tw *tableWriter) addStream() {
+	ms, err := tw.newManagedStream(tw.ctx)
+
+	tw.streamMu.Lock()
+	defer tw.streamMu.Unlock()
+	tw.scaling = false
+	if err != nil {
+		log.Printf("Creating an additional managed stream with destination table: %s for output instance with id: %d failed: %s", tw.tableRef, tw.id, err)
+		return
+	}
+	if tw.closed {
+		// close ran while the stream was being created; nothing was appended to it.
+		ms.Close()
+		return
+	}
+	tw.streams = append(tw.streams, &streamConfig{managedstream: ms})
 }
 
 // close finalizes (exactly-once only) and closes all streams of this table.
@@ -661,6 +692,7 @@ func (tw *tableWriter) maybeScale() {
 func (tw *tableWriter) close(ctx context.Context) bool {
 	tw.streamMu.Lock()
 	defer tw.streamMu.Unlock()
+	tw.closed = true
 	errFlag := false
 	for i, stream := range tw.streams {
 		if stream.managedstream == nil {

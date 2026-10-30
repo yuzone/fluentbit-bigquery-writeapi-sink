@@ -339,39 +339,39 @@ func TestErrorHandlingExactlyOnce(t *testing.T) {
 
 // This test validates that a missing column is populated with its default value
 func TestDefaultValue(t *testing.T) {
-    ctx := context.Background()
+	ctx := context.Background()
 
-    // Define schema of relevant BigQuery table
-    tableSchema := bigquery.Schema{
-        {Name: "foo", Type: bigquery.StringFieldType, DefaultValueExpression: "'extra'"},
-        {Name: "Message", Type: bigquery.StringFieldType},
-    }
+	// Define schema of relevant BigQuery table
+	tableSchema := bigquery.Schema{
+		{Name: "foo", Type: bigquery.StringFieldType, DefaultValueExpression: "'extra'"},
+		{Name: "Message", Type: bigquery.StringFieldType},
+	}
 
-    // Set up bigquery client and create dataset & table within existing project
+	// Set up bigquery client and create dataset & table within existing project
 	// Create config file with relevant parameters & create log file
 	client, dataset, fullTableID, file := setupBQTableAndFiles(ctx, t, tableSchema, "false")
 	defer client.Close()
 	defer file.Close()
 
-    // Start Fluent Bit with the config file
-    FBcmd := exec.Command("fluent-bit", "-c", configFileName)
-    if err := FBcmd.Start(); err != nil {
-        t.Fatalf("Failed to start Fluent Bit: %v", err)
-    }
+	// Start Fluent Bit with the config file
+	FBcmd := exec.Command("fluent-bit", "-c", configFileName)
+	if err := FBcmd.Start(); err != nil {
+		t.Fatalf("Failed to start Fluent Bit: %v", err)
+	}
 
-    // Wait for fluent-bit connection to generate data; add delays before ending fluent-bit process
-    time.Sleep(2 * time.Second)
-    if err := generateData(numRows, (2 * time.Second), false); err != nil {
-        t.Fatalf("Failed to generate data: %v", err)
-    }
-    time.Sleep(2 * time.Second)
+	// Wait for fluent-bit connection to generate data; add delays before ending fluent-bit process
+	time.Sleep(2 * time.Second)
+	if err := generateData(numRows, (2 * time.Second), false); err != nil {
+		t.Fatalf("Failed to generate data: %v", err)
+	}
+	time.Sleep(2 * time.Second)
 
-    // Stop Fluent Bit
-    if err := FBcmd.Process.Kill(); err != nil {
-        t.Fatalf("Failed to stop Fluent Bit: %v", err)
-    }
+	// Stop Fluent Bit
+	if err := FBcmd.Process.Kill(); err != nil {
+		t.Fatalf("Failed to stop Fluent Bit: %v", err)
+	}
 
-    // Verify data in BigQuery by querying
+	// Verify data in BigQuery by querying
 	queryMsg := "SELECT foo, Message FROM `" + fullTableID + "`"
 	BQquery := client.Query(queryMsg)
 	BQdata, err := BQquery.Read(ctx)
@@ -399,7 +399,7 @@ func TestDefaultValue(t *testing.T) {
 	// Verify the number of rows
 	assert.Equal(t, numRows, rowCount)
 
-    // Clean up - delete the BigQuery dataset and its contents(includes generated table) as well as config & log files
+	// Clean up - delete the BigQuery dataset and its contents(includes generated table) as well as config & log files
 	cleanUpBQDatasetAndFiles(ctx, t, dataset)
 }
 
