@@ -37,9 +37,14 @@ import (
 
 // streamConfig holds the state of one managed stream. A tableWriter owns one or more.
 type streamConfig struct {
+	// managedstream is nil while a committed stream is being rebuilt, or after a rebuild
+	// failed (see rebuildStream); the next flush then rebuilds it before appending.
 	managedstream MWManagedStream
 	appendResults []appendResult
 	offsetCounter int64
+	// rebuilding is set while rebuildStream is replacing managedstream outside streamMu, so
+	// that concurrent flushes fail fast instead of starting a second rebuild.
+	rebuilding bool
 }
 
 // tableWriter owns every piece of per-table state: the destination table, its
@@ -77,6 +82,12 @@ type tableWriter struct {
 // timeout, and for every flush of that table until the blocked call completes. It is treated
 // as transient so that Fluent Bit keeps the chunk and retries.
 var errAppendBlocked = errors.New("AppendRows is blocked, the backend is probably unreachable")
+
+// errStreamRebuilding is returned (wrapped) by the exactly-once path while the committed
+// stream has no usable managed stream: a rebuild is in progress in another flush, or a
+// previous rebuild failed and this flush could not complete a new one. It is treated as
+// transient so that Fluent Bit keeps the chunk and retries.
+var errStreamRebuilding = errors.New("the committed stream is being rebuilt")
 
 // newTableWriter fetches the table schema and opens the first managed stream.
 // ctx must be the instance-scoped context: it is retained for AppendRows and stream
@@ -408,15 +419,64 @@ func (tw *tableWriter) newManagedStream(ctx context.Context) (MWManagedStream, e
 	}
 }
 
-// This function returns whether or not the response indicates an invalid stream
+// rebuildPredicate reports whether an append was rejected because the committed stream itself
+// is no longer valid (StorageError INVALID_STREAM_TYPE), in which case it must be replaced.
+// ExtractProtoMessage returns nil when the detail was found.
 func rebuildPredicate(err error) bool {
 	if apiErr, ok := apierror.FromError(err); ok {
 		storageErr := &storagepb.StorageError{}
-		if e := apiErr.Details().ExtractProtoMessage(storageErr); e != nil {
+		if e := apiErr.Details().ExtractProtoMessage(storageErr); e == nil {
 			return storageErr.GetCode() == storagepb.StorageError_INVALID_STREAM_TYPE
 		}
 	}
 	return false
+}
+
+// rebuildStream replaces the committed stream at streamIndex after the backend rejected it
+// with INVALID_STREAM_TYPE. The old stream is detached under streamMu and finalized, closed
+// and replaced outside it, so that concurrent flushes of this table fail fast with
+// errStreamRebuilding instead of waiting up to cfg.initTimeout for the lock. A new committed
+// stream starts at offset 0, so the offset counter is reset with it.
+//
+// On failure managedstream stays nil: the closed stream is never used again (its AppendRows
+// would report io.EOF forever) and the next flush retries the rebuild. A stream that is
+// created after close ran is closed instead of being installed.
+func (tw *tableWriter) rebuildStream(ctx context.Context, streamIndex int) error {
+	tw.streamMu.Lock()
+	stream := tw.streams[streamIndex]
+	if stream.rebuilding {
+		tw.streamMu.Unlock()
+		return fmt.Errorf("%w: another flush is rebuilding it", errStreamRebuilding)
+	}
+	stream.rebuilding = true
+	old := stream.managedstream
+	stream.managedstream = nil
+	tw.streamMu.Unlock()
+
+	if old != nil {
+		log.Printf("Rebuilding the committed stream for table %s for output instance with id: %d", tw.tableRef, tw.id)
+		if _, err := old.Finalize(ctx); err != nil {
+			log.Printf("Finalizing the invalid committed stream for table %s for output instance with id: %d failed: %s", tw.tableRef, tw.id, err)
+		}
+		if err := old.Close(); err != nil && !errors.Is(err, io.EOF) {
+			log.Printf("Closing the invalid committed stream for table %s for output instance with id: %d failed: %s", tw.tableRef, tw.id, err)
+		}
+	}
+	ms, err := tw.newManagedStream(tw.ctx)
+
+	tw.streamMu.Lock()
+	defer tw.streamMu.Unlock()
+	stream.rebuilding = false
+	if err != nil {
+		return fmt.Errorf("rebuilding the committed stream for table %s failed: %w", tw.tableRef, err)
+	}
+	if tw.closed {
+		ms.Close()
+		return fmt.Errorf("%w: table writer was closed while rebuilding the committed stream", context.Canceled)
+	}
+	stream.managedstream = ms
+	stream.offsetCounter = 0
+	return nil
 }
 
 // sendRequestExactlyOnce sends and checks the response for data through a committed stream.
@@ -427,9 +487,15 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 	defer tw.streamMu.Unlock()
 
 	currStream := tw.streams[streamIndex]
+	ms := currStream.managedstream
+	if ms == nil {
+		return fmt.Errorf("%w: no usable stream", errStreamRebuilding)
+	}
 
 	// If the append completes after the flush timed out, the rows have been written at this
 	// offset; advance the counter so the chunk redelivered by Fluent Bit lands at the next one.
+	// The counter belongs to the stream the rows were appended to: once that stream has been
+	// rebuilt the new one starts at offset 0 and must not be advanced.
 	late := func(result appendResult, err error) {
 		if err != nil {
 			return
@@ -440,9 +506,11 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 		}
 		tw.streamMu.Lock()
 		defer tw.streamMu.Unlock()
-		currStream.offsetCounter += int64(len(data))
+		if currStream.managedstream == ms {
+			currStream.offsetCounter += int64(len(data))
+		}
 	}
-	result, err := tw.appendRows(ctx, currStream, data, late, managedwriter.WithOffset(currStream.offsetCounter))
+	result, err := tw.appendRows(ctx, ms, data, late, managedwriter.WithOffset(currStream.offsetCounter))
 	if err != nil {
 		return err
 	}
@@ -457,13 +525,15 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 }
 
 // sendRequestRetries enables synchronous retries and rebuilding a valid stream based on the server response.
-// The streamMu is held while closing and rebuilding the stream (rebuildPredicate path) so that no other
-// worker (workers > 1 scenario) can use the stream concurrently during the teardown/rebuild.
-// Note: this means network I/O (Finalize, Close, buildStream) runs under the lock on that path,
-// which is a known trade-off
+// An append rejected with INVALID_STREAM_TYPE (or made while the stream has no usable managed
+// stream) triggers rebuildStream and is retried once on the new stream without counting as an
+// attempt. At most one rebuild is performed per flush so that a backend that keeps rejecting
+// the new stream cannot keep this flush looping; the error is reported instead and Fluent Bit
+// redelivers the chunk.
 func (tw *tableWriter) sendRequestRetries(ctx context.Context, data [][]byte, streamIndex int) error {
 	retryer := newStatelessRetryer(tw.cfg.numRetries)
 	attempt := 0
+	rebuilt := false
 	for {
 		err := tw.sendRequestExactlyOnce(ctx, data, streamIndex)
 		if err == nil {
@@ -475,19 +545,14 @@ func (tw *tableWriter) sendRequestRetries(ctx context.Context, data [][]byte, st
 			// back to Fluent Bit.
 			return err
 		}
-		if rebuildPredicate(err) {
-			// Hold streamMu while closing and rebuilding the stream so no concurrent
-			// worker (workers > 1) can observe a partially-closed or replaced stream.
-			tw.streamMu.Lock()
-			currStream := tw.streams[streamIndex]
-			currStream.managedstream.Finalize(ctx)
-			currStream.managedstream.Close()
-			// Rebuild stream
-			buildErr := tw.buildStream(tw.ctx, streamIndex)
-			tw.streamMu.Unlock()
-			if buildErr != nil {
+		if errors.Is(err, errStreamRebuilding) || rebuildPredicate(err) {
+			if rebuilt {
+				return err
+			}
+			if buildErr := tw.rebuildStream(ctx, streamIndex); buildErr != nil {
 				return buildErr
 			}
+			rebuilt = true
 			// Retry sending data without incrementing number of attempts or waiting between attempts
 		} else {
 			backoffPeriod, shouldRetry := retryer.Retry(err, attempt)
@@ -523,7 +588,7 @@ func (tw *tableWriter) sendRequestDefault(ctx context.Context, data [][]byte, st
 			tw.queueResult(currStream, result)
 		}
 	}
-	result, err := tw.appendRows(ctx, currStream, data, late)
+	result, err := tw.appendRows(ctx, currStream.managedstream, data, late)
 	if err != nil {
 		return err
 	}
@@ -549,11 +614,11 @@ type appendOutcome struct {
 // redelivers the chunk (FLB_RETRY) without piling up more blocked appends. The redelivered
 // chunk is appended again after the blocked one completes, which is the usual
 // at-least-once duplicate.
-func (tw *tableWriter) appendRows(ctx context.Context, stream *streamConfig, data [][]byte, late func(appendResult, error), opts ...managedwriter.AppendOption) (appendResult, error) {
+func (tw *tableWriter) appendRows(ctx context.Context, ms MWManagedStream, data [][]byte, late func(appendResult, error), opts ...managedwriter.AppendOption) (appendResult, error) {
 	done := make(chan appendOutcome, 1)
 	started := time.Now()
 	go func() {
-		result, err := stream.managedstream.AppendRows(tw.ctx, data, opts...)
+		result, err := ms.AppendRows(tw.ctx, data, opts...)
 		done <- appendOutcome{result: result, err: err}
 	}()
 
