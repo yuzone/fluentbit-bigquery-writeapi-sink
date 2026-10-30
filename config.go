@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -37,14 +38,37 @@ const (
 	dateTimeDefault            = true
 	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC; values above this are treated as already in microseconds
 	flushTimeoutSecDefault     = 10         // default Flush_Timeout_Sec: 10 seconds per flush call
+	tagDelimitersDefault       = "."        // default Tag_Delimiters used to split the tag for $TAG[n]
 )
+
+// unknownTableAction is what FLBPluginFlushCtx does when the table resolved from the tag
+// cannot be initialized.
+type unknownTableAction int
+
+const (
+	unknownTableDrop  unknownTableAction = iota // log and acknowledge the chunk (FLB_OK)
+	unknownTableRetry                           // ask Fluent Bit to retry the chunk (FLB_RETRY)
+)
+
+func parseUnknownTableAction(s string) (unknownTableAction, error) {
+	switch strings.ToLower(s) {
+	case "", "drop":
+		return unknownTableDrop, nil
+	case "retry":
+		return unknownTableRetry, nil
+	}
+	return unknownTableDrop, fmt.Errorf("expected \"drop\" or \"retry\", got %q", s)
+}
 
 // outputConfig holds the instance-wide settings of one output instance together with the
 // shared client and the table writer(s) that belong to it.
 type outputConfig struct {
-	projectID string
-	datasetID string
-	tableID   string
+	projectID       string
+	datasetTemplate *tagTemplate // DatasetId, may reference $TAG
+	tableTemplate   *tagTemplate // TableId, may reference $TAG
+	tagDelimiters   string
+	preloadTables   []string
+	unknownTable    unknownTableAction
 
 	exactlyOnce           bool
 	streamType            managedwriter.StreamType
@@ -58,7 +82,7 @@ type outputConfig struct {
 	flushTimeout          time.Duration
 
 	client ManagedWriterClient
-	writer *tableWriter
+	router *tableRouter
 
 	// instanceCtx is a long-lived context, scoped to the lifetime of the output instance,
 	// used for AppendRows and managed stream creation. Unlike the per-flush context, it is not
@@ -99,11 +123,28 @@ func getConfigField[T int | bool](plugin unsafe.Pointer, key string, defaultval 
 func parseOutputConfig(plugin unsafe.Pointer) (*outputConfig, error) {
 	cfg := &outputConfig{
 		projectID: output.FLBPluginConfigKey(plugin, "ProjectID"),
-		datasetID: output.FLBPluginConfigKey(plugin, "DatasetID"),
-		tableID:   output.FLBPluginConfigKey(plugin, "TableID"),
 	}
 
 	var err error
+	if cfg.datasetTemplate, err = parseTagTemplate(output.FLBPluginConfigKey(plugin, "DatasetID")); err != nil {
+		return nil, fmt.Errorf("Invalid DatasetId parameter in configuration file: %w", err)
+	}
+	if cfg.tableTemplate, err = parseTagTemplate(output.FLBPluginConfigKey(plugin, "TableID")); err != nil {
+		return nil, fmt.Errorf("Invalid TableId parameter in configuration file: %w", err)
+	}
+	cfg.tagDelimiters = output.FLBPluginConfigKey(plugin, "Tag_Delimiters")
+	if cfg.tagDelimiters == "" {
+		cfg.tagDelimiters = tagDelimitersDefault
+	}
+	for _, t := range strings.Split(output.FLBPluginConfigKey(plugin, "Preload_Tables"), ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			cfg.preloadTables = append(cfg.preloadTables, t)
+		}
+	}
+	if cfg.unknownTable, err = parseUnknownTableAction(output.FLBPluginConfigKey(plugin, "Unknown_Table_Action")); err != nil {
+		return nil, fmt.Errorf("Invalid Unknown_Table_Action parameter in configuration file: %w", err)
+	}
+
 	if cfg.exactlyOnce, err = getConfigField(plugin, "Exactly_Once", exactlyOnceDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Exactly_Once parameter in configuration file: %w", err)
 	}

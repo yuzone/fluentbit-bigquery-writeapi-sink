@@ -31,6 +31,9 @@ var (
 	configID  atomic.Int64
 )
 
+// cChar aliases C.char so that _test.go files (which cannot import "C") can build a tag pointer.
+type cChar = C.char
+
 // ManagedWriterClient wraps *managedwriter.Client so that tests can inject a mock.
 type ManagedWriterClient interface {
 	NewManagedStream(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error)
@@ -110,13 +113,14 @@ func getInstanceCount() int {
 	return len(configMap)
 }
 
-// getOffset is a test-only helper that returns the offset counter of the first stream of the instance.
+// getOffset is a test-only helper that returns the offset counter of the first stream of the
+// instance's static table writer.
 func getOffset(id int) int64 {
 	config, ok := configMap[id]
-	if !ok || config == nil || config.writer == nil {
+	if !ok || config == nil || config.router == nil || config.router.static == nil {
 		return 0
 	}
-	return config.writer.offset()
+	return config.router.static.offset()
 }
 
 //export FLBPluginRegister
@@ -145,11 +149,17 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 
 	id := int(configID.Add(1) - 1)
 
-	cfg.writer, err = newTableWriter(cfg.instanceCtx, cfg.client, cfg.projectID, cfg.datasetID, cfg.tableID, cfg, id)
-	if err != nil {
+	// A static destination is initialized here (schema fetch + first stream), so a missing
+	// table still fails plugin start-up. A tag-dependent destination only initializes
+	// Preload_Tables; other tables are initialized on first flush.
+	cfg.router = newTableRouter(cfg, id)
+	if err := cfg.router.init(); err != nil {
 		cfg.instanceCancel()
 		log.Printf("FLBPluginInit: %s", err)
 		return output.FLB_ERROR
+	}
+	if cfg.router.dynamic() {
+		log.Printf("Output instance with id: %d routes by tag (DatasetId=%q TableId=%q Tag_Delimiters=%q)", id, cfg.datasetTemplate.raw, cfg.tableTemplate.raw, cfg.tagDelimiters)
 	}
 
 	configMap[id] = cfg
@@ -169,7 +179,7 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 // flushChunk sends binaryData through the table writer and logs failures.
 func flushChunk(ctx context.Context, tw *tableWriter, id int, binaryData [][]byte) {
 	if err := tw.flush(ctx, binaryData); err != nil {
-		log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
+		log.Printf("Appending data for output instance with id: %d to table %s failed in FLBPluginFlushCtx: %s", id, tw.tableRef, err)
 	}
 }
 
@@ -217,7 +227,17 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		log.Printf("Finding configuration for output instance with id: %d failed in FLBPluginFlushCtx", id)
 		return output.FLB_ERROR
 	}
-	tw := config.writer
+
+	// Fluent Bit delivers exactly one tag per chunk, so the whole chunk goes to one table.
+	tagStr := C.GoString(tag)
+	tw, err := config.router.resolve(tagStr)
+	if err != nil {
+		log.Printf("Resolving destination table for output instance with id: %d and tag %q failed in FLBPluginFlushCtx: %s", id, tagStr, err)
+		if config.unknownTable == unknownTableRetry {
+			return output.FLB_RETRY
+		}
+		return output.FLB_OK
+	}
 
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), config.flushTimeout)
 	defer flushCancel()
@@ -254,15 +274,14 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 		log.Printf("Finding configuration for output instance with id: %d failed in FLBPluginExitCtx", id)
 		return output.FLB_ERROR
 	}
-	tw := config.writer
 
 	// Drain all pending responses before closing streams to avoid data loss.
 	// waitForResponse=true blocks until every in-flight AppendRows result is received.
 	// Use a timeout context (same duration as flush) so exit cannot hang indefinitely.
 	exitCtx, exitCancel := context.WithTimeout(context.Background(), config.flushTimeout)
 	defer exitCancel()
-	tw.drainResponses(exitCtx, true)
-	errFlag := tw.close(exitCtx)
+	writers := config.router.writers()
+	errFlag := config.router.closeAll(exitCtx)
 
 	if config.client != nil {
 		if err := config.client.Close(); err != nil {
@@ -282,9 +301,11 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 		return output.FLB_ERROR
 	}
 
-	// Release messagePool entries for this config's descriptor tree so that
+	// Release messagePool entries for every writer's descriptor tree so that
 	// the descriptors and their cached *dynamicpb.Message objects can be GC'd.
-	cleanupMsgPool(tw.messageDescriptor)
+	for _, tw := range writers {
+		cleanupMsgPool(tw.messageDescriptor)
+	}
 
 	return output.FLB_OK
 }

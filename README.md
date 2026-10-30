@@ -11,7 +11,9 @@ and is maintained independently. See [Attribution](#attribution).
 ## Features
 
 - Streams JSON records from any Fluent Bit input into an existing BigQuery table
-  using the table schema fetched at startup.
+  using the table schema fetched on first use.
+- Routes one output to many tables by resolving `TableId` (and `DatasetId`)
+  from the Fluent Bit tag (`TableId $TAG[1]`).
 - At-least-once delivery via the default stream (asynchronous acknowledgement),
   or exactly-once delivery via committed streams (synchronous acknowledgement).
 - Dynamic scale-out of default streams when the in-flight queue fills up.
@@ -103,8 +105,11 @@ Keys are matched case-insensitively by Fluent Bit.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `ProjectId` | string | (required) | GCP project that owns the table. |
-| `DatasetId` | string | (required) | BigQuery dataset. |
-| `TableId` | string | (required) | BigQuery table. The schema is fetched once at startup. |
+| `DatasetId` | string | (required) | BigQuery dataset. May contain `$TAG` / `$TAG[n]` (see [Routing by tag](#routing-by-tag)). |
+| `TableId` | string | (required) | BigQuery table. May contain `$TAG` / `$TAG[n]`. Without placeholders the schema is fetched once at startup and a missing table fails initialisation. |
+| `Tag_Delimiters` | string | `.` | Characters on which the tag is split for `$TAG[n]`. Every character in the value is a delimiter; empty parts are dropped. |
+| `Preload_Tables` | string | *(empty)* | Comma-separated table IDs to initialise at startup when `TableId` is tag-based. A missing preload table fails initialisation, restoring the start-up validation a static `TableId` provides. Requires a static `DatasetId`. |
+| `Unknown_Table_Action` | string | `drop` | What to do with a chunk whose table cannot be resolved or initialised: `drop` logs and acknowledges the chunk (`FLB_OK`); `retry` returns `FLB_RETRY` so Fluent Bit redelivers it. |
 | `Exactly_Once` | bool | `false` | `true` uses a committed stream with synchronous response checking (exactly-once). `false` uses the default stream with asynchronous response checking (at-least-once). |
 | `Num_Synchronous_Retries` | int | `4` | Maximum synchronous retries per append when `Exactly_Once` is `true`. Ignored otherwise. |
 | `Max_Chunk_Size` | int (bytes) | `9437184` (9 MiB) | Upper bound on the serialized size of a single `AppendRows` request. Values above 9 MiB are clamped to 9 MiB. |
@@ -115,6 +120,49 @@ Keys are matched case-insensitively by Fluent Bit.
 
 Boolean values are parsed with Go's `strconv.ParseBool` (`true`/`false`,
 `1`/`0`, `t`/`f`, …). An unparsable value fails plugin initialisation.
+
+### Routing by tag
+
+`DatasetId` and `TableId` accept the placeholders used by Fluent Bit's `out_s3`
+`s3_key_format`:
+
+| Placeholder | Meaning |
+|---|---|
+| `$TAG` | The whole tag. |
+| `$TAG[n]` | The n-th part (0-based) of the tag after splitting on `Tag_Delimiters`. |
+
+Any other text is kept literally. Fluent Bit delivers exactly one tag per
+chunk, so a chunk is always written to a single table.
+
+```yaml
+pipeline:
+  outputs:
+    - name: writeapi
+      match: 'app.*'
+      ProjectId: my-project
+      DatasetId: my_dataset
+      TableId: '$TAG[1]'          # app.orders.us -> table "orders"
+      Preload_Tables: orders,users
+      Unknown_Table_Action: retry
+```
+
+Behaviour:
+
+- A table is initialised (schema fetch + first stream) on the first chunk
+  carrying its tag. Initialisation happens once per table even when several
+  Fluent Bit workers flush concurrently; other tables are not blocked.
+- Resolved IDs are validated against BigQuery naming rules (table: Unicode
+  letters/marks/numbers, `_`, `-`, space, ≤ 1024 bytes; dataset: ASCII
+  letters/digits/`_`, ≤ 1024 bytes). Invalid IDs and `$TAG[n]` indexes out of
+  range are treated as unknown tables and never reach BigQuery.
+- A failed initialisation (for example `NOT_FOUND` for a mistyped tag) is
+  remembered for 60 s so a bad tag does not call `GetWriteStream` on every
+  flush.
+- `Max_Queue_Requests`, `Max_Queue_Bytes` and dynamic stream scaling (up to 10
+  streams) apply **per table**, as they did per output before. Fluent Bit's
+  own buffer limits (`storage.total_limit_size`, `Mem_Buf_Limit`) remain per
+  output, so keep very high-volume tables on dedicated outputs.
+- Shutdown drains and closes every table's streams.
 
 ## Accepted input type per BigQuery field type
 
