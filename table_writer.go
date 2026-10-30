@@ -671,7 +671,7 @@ func (tw *tableWriter) blockAppend(started time.Time, rows int, what string, wai
 	tw.blockedAppends.Add(1)
 	go func() {
 		o := wait()
-		log.Printf("Blocked append of %d rows to table %s for output instance with id: %d returned after %s (error: %v); resuming appends", rows, tw.tableRef, tw.id, time.Since(started).Round(time.Millisecond), o.err)
+		log.Printf("Blocked %s for %d rows to table %s for output instance with id: %d returned after %s (error: %v); resuming appends", what, rows, tw.tableRef, tw.id, time.Since(started).Round(time.Millisecond), o.err)
 		// Record the outcome before appends resume so that the next flush sees it.
 		late(o.result, o.err)
 		tw.blockedAppends.Add(-1)

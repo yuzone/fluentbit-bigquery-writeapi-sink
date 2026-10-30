@@ -311,7 +311,7 @@ func (h *harness) testShutdownDuringOutage(t *testing.T) {
 	if elapsed > 25*time.Second {
 		t.Fatalf("stopping fluent-bit took %s", elapsed)
 	}
-	if !strings.Contains(h.fluentBitLogs(), "has blocked AppendRows calls, cancelling them before closing") {
+	if !strings.Contains(h.fluentBitLogs(), "has blocked appends, cancelling them before closing") {
 		t.Fatalf("expected the plugin to cancel the blocked append on exit; logs:\n%s", h.fluentBitLogs())
 	}
 }

@@ -325,14 +325,16 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 		errFlag = true
 	}
 
-	// A blocked AppendRows (backend unreachable, or in-flight queue saturated) is still running
-	// on the instance context. When the backend is unreachable the managed writer's close paths
-	// wait for a connection lock held by that call, which only cancelling the instance context
-	// releases. Acknowledged appends were drained above and the blocked chunks were already
-	// reported as FLB_RETRY, so cancelling now loses nothing.
+	// A blocked append is still running on the instance context: either AppendRows itself
+	// (backend unreachable, or in-flight queue saturated) or, on a committed stream, the wait for
+	// the response of an AppendRows that did return. When the backend is unreachable the managed
+	// writer's close paths wait for a connection lock held by the blocked call, which only
+	// cancelling the instance context releases. Acknowledged appends were drained above and the
+	// blocked chunks were already reported as FLB_RETRY, so cancelling now loses nothing; the
+	// rows of a pending committed-stream response were sent before the cancel and stay written.
 	for _, tw := range writers {
 		if tw.blockedAppends.Load() > 0 {
-			log.Printf("Output instance with id: %d has blocked AppendRows calls, cancelling them before closing", id)
+			log.Printf("Output instance with id: %d has blocked appends, cancelling them before closing", id)
 			config.cancelInstance()
 			break
 		}
