@@ -1,0 +1,31 @@
+# Seed data for the BigQuery emulator. Every table shares the same schema so the
+# same records can be routed anywhere.
+projects:
+  - id: e2e
+    datasets:
+      - id: logs
+        tables:
+          - id: static_logs
+            columns:
+              - name: message
+                type: STRING
+              - name: seq
+                type: INT64
+          - id: orders
+            columns:
+              - name: message
+                type: STRING
+              - name: seq
+                type: INT64
+          - id: users
+            columns:
+              - name: message
+                type: STRING
+              - name: seq
+                type: INT64
+          - id: outage_logs
+            columns:
+              - name: message
+                type: STRING
+              - name: seq
+                type: INT64

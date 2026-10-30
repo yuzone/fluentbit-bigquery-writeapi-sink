@@ -24,6 +24,8 @@ import (
 
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -86,6 +88,8 @@ type outputConfig struct {
 	retryOnFailure        bool
 	enableMultiplexing    bool
 	multiplexPoolLimit    int
+	endpoint              string
+	insecure              bool
 
 	client ManagedWriterClient
 	router *tableRouter
@@ -205,6 +209,17 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 		log.Printf("Enable_Multiplexing is set together with Exactly_Once; committed streams cannot be multiplexed, so the option has no effect on this output")
 	}
 
+	cfg.endpoint = strings.TrimSpace(flb.ConfigKey(plugin, "Endpoint"))
+	if cfg.insecure, err = getConfigField(flb, plugin, "Insecure", false); err != nil {
+		return nil, fmt.Errorf("Invalid Insecure parameter in configuration file: %w", err)
+	}
+	if cfg.insecure && cfg.endpoint == "" {
+		return nil, fmt.Errorf("Invalid Insecure parameter in configuration file: requires Endpoint to be set")
+	}
+	if cfg.insecure {
+		log.Printf("Insecure is set: connecting to %s without TLS or authentication", cfg.endpoint)
+	}
+
 	// Set the stream type based on exactly once parameter
 	if cfg.exactlyOnce {
 		cfg.streamType = managedwriter.CommittedStream
@@ -218,11 +233,22 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 
 // clientOptions returns the managedwriter client options derived from the configuration.
 func (cfg *outputConfig) clientOptions() []option.ClientOption {
-	if !cfg.enableMultiplexing {
-		return nil
+	var opts []option.ClientOption
+	if cfg.enableMultiplexing {
+		opts = append(opts,
+			managedwriter.WithMultiplexing(),
+			managedwriter.WithMultiplexPoolLimit(cfg.multiplexPoolLimit),
+		)
 	}
-	return []option.ClientOption{
-		managedwriter.WithMultiplexing(),
-		managedwriter.WithMultiplexPoolLimit(cfg.multiplexPoolLimit),
+	if cfg.endpoint != "" {
+		opts = append(opts, option.WithEndpoint(cfg.endpoint))
 	}
+	if cfg.insecure {
+		// Emulators speak plaintext gRPC and do not validate credentials.
+		opts = append(opts,
+			option.WithoutAuthentication(),
+			option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
+		)
+	}
+	return opts
 }

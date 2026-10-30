@@ -500,6 +500,32 @@ func TestFLBPluginInitMultiplexing(t *testing.T) {
 	}
 }
 
+func TestFLBPluginInitEndpoint(t *testing.T) {
+	t.Run("endpoint only", func(t *testing.T) {
+		d := installTestDeps(t, defaultInitKeys(map[string]string{"Endpoint": " emulator:9060 "}))
+		initPlugin(t)
+		require.Len(t, d.clientOpts, 1)
+		assert.Equal(t, []option.ClientOption{option.WithEndpoint("emulator:9060")}, d.clientOpts[0])
+	})
+	t.Run("insecure endpoint", func(t *testing.T) {
+		d := installTestDeps(t, defaultInitKeys(map[string]string{"Endpoint": "emulator:9060", "Insecure": "true"}))
+		initPlugin(t)
+		require.Len(t, d.clientOpts, 1)
+		// The dial option wraps a fresh credentials object, so only the shape is checked.
+		require.Len(t, d.clientOpts[0], 3)
+		assert.Equal(t, option.WithEndpoint("emulator:9060"), d.clientOpts[0][0])
+		assert.Equal(t, option.WithoutAuthentication(), d.clientOpts[0][1])
+	})
+	t.Run("insecure without endpoint", func(t *testing.T) {
+		installTestDeps(t, defaultInitKeys(map[string]string{"Insecure": "true"}))
+		assert.Equal(t, output.FLB_ERROR, FLBPluginInit(unsafe.Pointer(new(int))))
+	})
+	t.Run("invalid insecure", func(t *testing.T) {
+		installTestDeps(t, defaultInitKeys(map[string]string{"Endpoint": "emulator:9060", "Insecure": "maybe"}))
+		assert.Equal(t, output.FLB_ERROR, FLBPluginInit(unsafe.Pointer(new(int))))
+	})
+}
+
 func TestFLBPluginInitMultiplexingInvalid(t *testing.T) {
 	for _, keys := range []map[string]string{
 		{"Enable_Multiplexing": "maybe"},

@@ -1,0 +1,22 @@
+name: E2E
+
+# Docker-based end-to-end scenarios against a BigQuery emulator (see hack/e2e).
+# Manual for now; promote to pull_request once the runtime is acceptable.
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+
+    # The harness prints the Fluent Bit logs itself when a scenario fails.
+    - name: Run end-to-end scenarios
+      run: make e2e

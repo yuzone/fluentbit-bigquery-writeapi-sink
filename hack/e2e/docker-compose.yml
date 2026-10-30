@@ -1,0 +1,43 @@
+# Local end-to-end stack: a BigQuery emulator, a TCP proxy in front of its gRPC port and a
+# real Fluent Bit loading the compiled out_writeapi.so. Driven by `make e2e` (see
+# e2e_test.go); not intended for production.
+services:
+  bigquery:
+    image: ghcr.io/goccy/bigquery-emulator:0.8.1
+    command:
+      - --project=e2e
+      - --data-from-yaml=/data.yaml
+      - --log-level=warn
+    volumes:
+      - ./bigquery/data.yaml:/data.yaml:ro
+    ports:
+      - "127.0.0.1:9050:9050"   # REST (used by the test to count rows)
+
+  # The plugin talks to the emulator through this proxy so that the test can simulate a
+  # backend outage (disable the proxy through the toxiproxy API: connections are refused)
+  # while the emulator itself stays reachable from the host.
+  bq-proxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command:
+      - -host=0.0.0.0
+      - -config=/toxiproxy.json
+    volumes:
+      - ./proxy/toxiproxy.json:/toxiproxy.json:ro
+    ports:
+      - "127.0.0.1:8474:8474"   # toxiproxy API (used by the test to toggle the proxy)
+    depends_on:
+      - bigquery
+
+  fluent-bit:
+    image: fluent/fluent-bit:5.1.5
+    command:
+      - /fluent-bit/bin/fluent-bit
+      - --config=/fluent-bit/etc/fluent-bit.conf
+    volumes:
+      - ./build/out_writeapi.so:/fluent-bit/etc/out_writeapi.so:ro
+      - ./fluent-bit/plugins.conf:/fluent-bit/etc/plugins.conf:ro
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+    ports:
+      - "127.0.0.1:9880:9880"   # in_http: POST /<tag> ingests records with that tag
+    depends_on:
+      - bq-proxy

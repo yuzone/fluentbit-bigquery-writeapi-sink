@@ -1,0 +1,8 @@
+[
+  {
+    "name": "bq",
+    "listen": "0.0.0.0:9060",
+    "upstream": "bigquery:9060",
+    "enabled": true
+  }
+]

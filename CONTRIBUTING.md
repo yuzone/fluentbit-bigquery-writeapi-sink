@@ -28,6 +28,8 @@ inside `<details>` blocks.
 
    The skipped tests are integration tests that need a real BigQuery table;
    see `integration_test.go` for the environment variables they read.
+   `make e2e` additionally runs the Docker-based end-to-end scenarios against
+   a BigQuery emulator (see the README's "End-to-end harness" section).
 4. Open a pull request against `main`. All changes, including those from
    maintainers, go through pull request review.
 

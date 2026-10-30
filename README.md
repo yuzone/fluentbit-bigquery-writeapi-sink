@@ -120,6 +120,8 @@ Keys are matched case-insensitively by Fluent Bit.
 | `Retry_On_Failure` | bool | `true` | `true` returns `FLB_RETRY` / `FLB_ERROR` to Fluent Bit when an append fails (see [Delivery semantics](#delivery-semantics)). `false` restores the historical behaviour of logging the failure and acknowledging the chunk. |
 | `Enable_Multiplexing` | bool | `false` | **EXPERIMENTAL.** Share gRPC connections between default streams of this output (see [Connection multiplexing](#connection-multiplexing)). |
 | `Multiplex_Pool_Limit` | int | `1` | **EXPERIMENTAL.** Maximum shared connections per BigQuery region when `Enable_Multiplexing` is `true`; ignored otherwise. Must be `>= 1`. |
+| `Endpoint` | string | _(Google default)_ | `host:port` of the Storage Write API gRPC endpoint. Only needed to target an emulator or a private endpoint. |
+| `Insecure` | bool | `false` | `true` disables TLS **and** authentication for `Endpoint` (plaintext gRPC, as spoken by emulators). Requires `Endpoint`; never use against Google's endpoints. |
 
 Boolean values are parsed with Go's `strconv.ParseBool` (`true`/`false`,
 `1`/`0`, `t`/`f`, …). An unparsable value fails plugin initialisation.
@@ -212,6 +214,14 @@ Which failures are visible at flush time depends on the mode:
   **logged only** (`Encountered error ... while verifying the server
   response`). The managed writer retries transient failures internally for
   this path.
+- **Backend outage (both modes)**: while the endpoint is unreachable the
+  managed writer keeps retrying to open the gRPC stream (`UNAVAILABLE`) for as
+  long as the output instance lives, so `AppendRows` **blocks** rather than
+  failing and the flush does not return until connectivity is back. Nothing is
+  lost: the chunk is written once the backend is reachable again. Size Fluent
+  Bit's buffer (`storage.*`, `Mem_Buf_Limit`) for the outages you want to
+  survive, since no `FLB_RETRY` is produced in this situation. Verified by the
+  `backend outage` scenario of the [end-to-end harness](#end-to-end-harness).
 - **Committed stream (`Exactly_Once true`)**: every append is confirmed
   synchronously and retried up to `Num_Synchronous_Retries` times for
   transient errors before the chunk is reported as `FLB_RETRY`.
@@ -292,6 +302,34 @@ go test -race -skip "^Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandli
 
 The skipped tests are integration tests that require a real BigQuery table.
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### End-to-end harness
+
+`hack/e2e` runs the compiled plugin inside a real Fluent Bit container against
+the [goccy/bigquery-emulator](https://github.com/goccy/bigquery-emulator) and
+asserts on the rows that reach each table. It needs Docker (with Compose v2)
+and nothing else, no GCP project or credentials:
+
+```sh
+make e2e          # builds hack/e2e/build/out_writeapi.so with Dockerfile.build, then runs the scenarios
+make e2e-down     # tears down a stack kept with E2E_KEEP=1
+```
+
+Scenarios (`hack/e2e/e2e_test.go`): static table, `$TAG[n]` routing to several
+tables, unknown table with `Unknown_Table_Action drop`, unknown table with
+`Unknown_Table_Action retry` (the table is created while Fluent Bit retries the
+chunk), and a backend outage simulated with a
+[toxiproxy](https://github.com/Shopify/toxiproxy) in front of the emulator.
+Set `E2E_KEEP=1` to leave the stack running after a failure for inspection
+(`docker compose -f hack/e2e/docker-compose.yml logs fluent-bit`).
+
+The harness uses the `Endpoint` / `Insecure` parameters and enables
+`Enable_Multiplexing` on every output: emulator releases up to 0.8.1 pick an
+arbitrary stream when a request omits `write_stream`, which the managed writer
+does on non-multiplexed connections (fixed upstream in
+goccy/bigquery-emulator#491, not released yet). The emulator also decodes
+every row with the first schema seen on a connection, so all e2e tables share
+one schema.
 
 ## Attribution
 
