@@ -233,6 +233,125 @@ func TestFLBPluginFlushCtxBlockedAppendExactlyOnceAdvancesOffset(t *testing.T) {
 	assert.Equal(t, int32(0), tw.blockedAppends.Load())
 }
 
+// During an outage the managed writer's Close waits for a connection lock held by the blocked
+// AppendRows, which only cancelling the instance context releases. FLBPluginExitCtx must drain
+// the responses of acknowledged appends, then cancel before closing when an append is blocked,
+// so that shutdown completes instead of hanging until SIGKILL. The real Close reports
+// context.Canceled after such a cancel; that is not a failure.
+func TestFLBPluginExitCtxBlockedAppendCancelsInstance(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.retryOnFailure = true
+		c.flushTimeout = 50 * time.Millisecond
+	})
+	require.NoError(t, f.router.init())
+	instanceCtx := f.cfg.instanceCtx
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "hello"})
+
+	// An acknowledged append whose response is still pending (healthy path, before the outage).
+	acked := pendingResult()
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) { return acked, nil })
+	require.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	f.stream.mu.Lock()
+	f.stream.onClose = func() error {
+		<-instanceCtx.Done() // the real Close deadlocks until the blocked append is cancelled
+		return context.Canceled
+	}
+	f.stream.mu.Unlock()
+	require.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	require.Equal(t, int32(1), f.router.static.blockedAppends.Load())
+
+	start := time.Now()
+	assert.Equal(t, output.FLB_OK, FLBPluginExitCtx(ptr))
+	assert.Less(t, time.Since(start), f.cfg.flushTimeout, "cancels before waiting out the exit deadline")
+	assert.Error(t, instanceCtx.Err())
+	assert.Equal(t, int32(1), acked.getCalls.Load(), "the acknowledged append is still drained")
+	assert.Equal(t, int32(1), f.stream.closes.Load())
+	assert.Equal(t, int32(1), f.client.closes.Load())
+}
+
+// When closing hangs for another reason (no blocked append was observed yet), the exit deadline
+// cancels the instance context and the exit still returns, reporting the failure.
+func TestFLBPluginExitCtxCloseTimeoutCancelsInstance(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.flushTimeout = 50 * time.Millisecond })
+	require.NoError(t, f.router.init())
+	instanceCtx := f.cfg.instanceCtx
+	f.stream.mu.Lock()
+	f.stream.onClose = func() error {
+		<-instanceCtx.Done()
+		return io.EOF
+	}
+	f.stream.mu.Unlock()
+	ptr := registerTestConfig(t, f.cfg)
+
+	start := time.Now()
+	assert.Equal(t, output.FLB_ERROR, FLBPluginExitCtx(ptr))
+	assert.Less(t, time.Since(start), 2*f.cfg.flushTimeout+time.Second)
+	assert.Error(t, instanceCtx.Err())
+	assert.Equal(t, int32(1), f.stream.closes.Load())
+	assert.Equal(t, int32(1), f.client.closes.Load(), "the client is still closed after a stream close timeout")
+}
+
+// Schema fetch and stream creation retry UNAVAILABLE for minutes by default; both must give up
+// after Init_Timeout_Sec so an unreachable backend cannot hang FLBPluginInit. A stream created
+// after the deadline is closed rather than leaked.
+func TestTableWriterInitTimeout(t *testing.T) {
+	t.Run("schema fetch", func(t *testing.T) {
+		f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.initTimeout = 50 * time.Millisecond })
+		f.client.blockGet = make(chan struct{})
+		defer close(f.client.blockGet)
+
+		start := time.Now()
+		err := f.router.init()
+		require.Error(t, err)
+		assert.True(t, isTransientError(err), "deadline errors are transient: %v", err)
+		assert.Less(t, time.Since(start), time.Second)
+		assert.Equal(t, 0, f.client.newStreamCalls())
+	})
+	t.Run("stream creation", func(t *testing.T) {
+		f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.initTimeout = 50 * time.Millisecond })
+		f.client.blockNew = make(chan struct{})
+
+		start := time.Now()
+		err := f.router.init()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Less(t, time.Since(start), time.Second)
+		assert.Nil(t, f.router.static)
+
+		close(f.client.blockNew)
+		require.Eventually(t, func() bool { return f.stream.closes.Load() == 1 }, time.Second, time.Millisecond,
+			"a stream created after the deadline is closed")
+	})
+}
+
+// A transient failure while initializing a tag-routed table (backend unreachable) is not an
+// unknown table: the chunk is retried even with Unknown_Table_Action drop, and the failure is
+// not cached for initFailureTTL so the next flush tries again right away.
+func TestFLBPluginFlushCtxTransientInitFailureRetries(t *testing.T) {
+	f := newRouterFixture(t, "ds", "$TAG[1]", func(c *outputConfig) {
+		c.unknownTable = unknownTableDrop
+		c.retryOnFailure = true
+	})
+	require.NoError(t, f.router.init())
+	f.failTable("ds", "orders", status.Error(codes.Unavailable, "x"))
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "hello"})
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app.orders")))
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app.orders")))
+	assert.Equal(t, int32(2), f.calls("ds", "orders"), "transient init failures are not cached")
+
+	f.unfailTable("ds", "orders")
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app.orders")))
+	assert.Equal(t, int32(1), f.appendCalls())
+}
+
 // In exactly-once mode the synchronous GetResult error (after the configured retries) decides
 // the return code.
 func TestFLBPluginFlushCtxExactlyOnceReturnCodes(t *testing.T) {

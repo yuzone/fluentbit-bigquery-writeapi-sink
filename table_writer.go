@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"strconv"
@@ -74,11 +75,15 @@ var errAppendBlocked = errors.New("AppendRows is blocked, the backend is probabl
 // newTableWriter fetches the table schema and opens the first managed stream.
 // ctx must be the instance-scoped context: it is retained for AppendRows and stream
 // (re)creation so that the managed writer's internal retry/reconnect is not tied to a
-// per-flush context.
+// per-flush context. Both steps are unary RPCs whose library defaults retry UNAVAILABLE for
+// 10 minutes, so each is bounded by cfg.initTimeout to keep plugin start-up (and the first
+// flush of a tag-routed table) from hanging while the backend is unreachable.
 func newTableWriter(ctx context.Context, client ManagedWriterClient, project, dataset, table string, cfg *outputConfig, id int) (*tableWriter, error) {
 	tableRef := fmt.Sprintf("projects/%s/datasets/%s/tables/%s", project, dataset, table)
 
-	md, descriptor, timestampFields, err := getDescriptors(ctx, client, project, dataset, table, cfg.dateTimeStringType)
+	schemaCtx, cancel := context.WithTimeout(ctx, cfg.initTimeout)
+	defer cancel()
+	md, descriptor, timestampFields, err := getDescriptors(schemaCtx, client, project, dataset, table, cfg.dateTimeStringType)
 	if err != nil {
 		return nil, fmt.Errorf("Getting message descriptor and descriptor proto for table: %s failed: %w", tableRef, err)
 	}
@@ -344,23 +349,48 @@ func (tw *tableWriter) drainResponses(ctx context.Context, waitForResponse bool)
 	}
 }
 
-// buildStream creates the managed stream at streamIndex.
+// buildStream creates the managed stream at streamIndex. NewManagedStream performs unary RPCs
+// (GetWriteStream, plus CreateWriteStream for committed streams) that retry for minutes by
+// default. The call is bounded by cfg.initTimeout; ctx itself cannot carry the deadline
+// because the stream retains it for its whole lifetime. A stream that is created after the
+// deadline is closed so that it does not leak.
 func (tw *tableWriter) buildStream(ctx context.Context, streamIndex int) error {
-	currManagedStream, err := tw.client.NewManagedStream(ctx,
-		managedwriter.WithType(tw.cfg.streamType),
-		managedwriter.WithDestinationTable(tw.tableRef),
-		// Use the descriptor proto when creating the new managed stream
-		managedwriter.WithSchemaDescriptor(tw.schemaDesc),
-		managedwriter.EnableWriteRetries(tw.cfg.enableRetry),
-		managedwriter.WithMaxInflightBytes(tw.cfg.maxQueueBytes),
-		managedwriter.WithMaxInflightRequests(tw.cfg.maxQueueRequests),
-		managedwriter.WithDefaultMissingValueInterpretation(storagepb.AppendRowsRequest_DEFAULT_VALUE),
-		managedwriter.WithTraceID("FluentBit"),
-	)
-	if err == nil {
-		tw.streams[streamIndex].managedstream = currManagedStream
+	type created struct {
+		ms  MWManagedStream
+		err error
 	}
-	return err
+	done := make(chan created, 1)
+	go func() {
+		ms, err := tw.client.NewManagedStream(ctx,
+			managedwriter.WithType(tw.cfg.streamType),
+			managedwriter.WithDestinationTable(tw.tableRef),
+			// Use the descriptor proto when creating the new managed stream
+			managedwriter.WithSchemaDescriptor(tw.schemaDesc),
+			managedwriter.EnableWriteRetries(tw.cfg.enableRetry),
+			managedwriter.WithMaxInflightBytes(tw.cfg.maxQueueBytes),
+			managedwriter.WithMaxInflightRequests(tw.cfg.maxQueueRequests),
+			managedwriter.WithDefaultMissingValueInterpretation(storagepb.AppendRowsRequest_DEFAULT_VALUE),
+			managedwriter.WithTraceID("FluentBit"),
+		)
+		done <- created{ms, err}
+	}()
+
+	timer := time.NewTimer(tw.cfg.initTimeout)
+	defer timer.Stop()
+	select {
+	case c := <-done:
+		if c.err == nil {
+			tw.streams[streamIndex].managedstream = c.ms
+		}
+		return c.err
+	case <-timer.C:
+		go func() {
+			if c := <-done; c.err == nil {
+				c.ms.Close()
+			}
+		}()
+		return fmt.Errorf("stream creation did not complete within %s: %w", tw.cfg.initTimeout, context.DeadlineExceeded)
+	}
 }
 
 // This function returns whether or not the response indicates an invalid stream
@@ -625,7 +655,9 @@ func (tw *tableWriter) maybeScale() {
 }
 
 // close finalizes (exactly-once only) and closes all streams of this table.
-// It returns true if any stream failed to finalize or close.
+// It returns true if any stream failed to finalize or close. ManagedStream.Close reports a
+// normal close as io.EOF, and context.Canceled once the instance context has been cancelled
+// on purpose during shutdown; neither is a failure.
 func (tw *tableWriter) close(ctx context.Context) bool {
 	tw.streamMu.Lock()
 	defer tw.streamMu.Unlock()
@@ -640,10 +672,12 @@ func (tw *tableWriter) close(ctx context.Context) bool {
 				errFlag = true
 			}
 		}
-		if err := stream.managedstream.Close(); err != nil {
-			log.Printf("Closing managed stream for output instance with id %d and stream index %d failed in FLBPluginExitCtx: %s", tw.id, i, err)
-			errFlag = true
+		err := stream.managedstream.Close()
+		if err == nil || errors.Is(err, io.EOF) || (errors.Is(err, context.Canceled) && tw.ctx.Err() != nil) {
+			continue
 		}
+		log.Printf("Closing managed stream for output instance with id %d and stream index %d failed in FLBPluginExitCtx: %s", tw.id, i, err)
+		errFlag = true
 	}
 	return errFlag
 }

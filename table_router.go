@@ -110,7 +110,8 @@ func (r *tableRouter) resolve(tag string) (*tableWriter, error) {
 
 // writerFor returns the writer for (dataset, table), initializing it exactly once even under
 // concurrent flushes. Other tables are not blocked while one table initializes. A failed
-// initialization is cached for initFailureTTL.
+// initialization is cached for initFailureTTL, except when the failure was transient (backend
+// unreachable rather than table missing): then the next flush retries right away.
 func (r *tableRouter) writerFor(dataset, table string) (*tableWriter, error) {
 	key := dataset + "/" + table
 
@@ -134,7 +135,11 @@ func (r *tableRouter) writerFor(dataset, table string) (*tableWriter, error) {
 
 		r.mu.Lock()
 		e.tw, e.err = tw, err
-		if err != nil {
+		switch {
+		case err == nil:
+		case isTransientError(err):
+			delete(r.entries, key)
+		default:
 			e.failedAt = r.cfg.clock.now()
 		}
 		r.mu.Unlock()
@@ -171,11 +176,17 @@ func (r *tableRouter) writers() []*tableWriter {
 	return out
 }
 
-// closeAll drains pending responses and closes every writer. It returns true if any close failed.
+// drainAll waits (until ctx expires) for the pending responses of every writer.
+func (r *tableRouter) drainAll(ctx context.Context) {
+	for _, tw := range r.writers() {
+		tw.drainResponses(ctx, true)
+	}
+}
+
+// closeAll closes every writer. It returns true if any close failed.
 func (r *tableRouter) closeAll(ctx context.Context) bool {
 	errFlag := false
 	for _, tw := range r.writers() {
-		tw.drainResponses(ctx, true)
 		if tw.close(ctx) {
 			errFlag = true
 		}

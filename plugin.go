@@ -16,8 +16,11 @@ package main
 import (
 	"C"
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/fluent/fluent-bit-go/output"
@@ -246,7 +249,9 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	tw, err := config.router.resolve(tagStr)
 	if err != nil {
 		log.Printf("Resolving destination table for output instance with id: %d and tag %q failed in FLBPluginFlushCtx: %s", id, tagStr, err)
-		if config.unknownTable == unknownTableRetry {
+		// A transient failure means the backend could not be reached, not that the table is
+		// unknown, so it is handled like a transient append failure.
+		if config.unknownTable == unknownTableRetry || (config.retryOnFailure && isTransientError(err)) {
 			return output.FLB_RETRY
 		}
 		return output.FLB_OK
@@ -299,10 +304,42 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 	exitCtx, exitCancel := context.WithTimeout(context.Background(), config.flushTimeout)
 	defer exitCancel()
 	writers := config.router.writers()
-	errFlag := config.router.closeAll(exitCtx)
+	errFlag := false
+
+	// Draining honours exitCtx itself; the wrapper only guards against the library misbehaving.
+	if err := awaitShutdownStep(exitCtx, config, id, "Draining pending responses", func() error {
+		config.router.drainAll(exitCtx)
+		return nil
+	}); err != nil {
+		log.Printf("Draining pending responses for output instance with id: %d failed in FLBPluginExitCtx: %s", id, err)
+		errFlag = true
+	}
+
+	// A blocked AppendRows (backend unreachable, or in-flight queue saturated) is still running
+	// on the instance context. When the backend is unreachable the managed writer's close paths
+	// wait for a connection lock held by that call, which only cancelling the instance context
+	// releases. Acknowledged appends were drained above and the blocked chunks were already
+	// reported as FLB_RETRY, so cancelling now loses nothing.
+	for _, tw := range writers {
+		if tw.blockedAppends.Load() > 0 {
+			log.Printf("Output instance with id: %d has blocked AppendRows calls, cancelling them before closing", id)
+			config.cancelInstance()
+			break
+		}
+	}
+
+	if err := awaitShutdownStep(exitCtx, config, id, "Closing managed streams", func() error {
+		if config.router.closeAll(exitCtx) {
+			return errors.New("one or more streams failed to close")
+		}
+		return nil
+	}); err != nil {
+		log.Printf("Closing managed streams for output instance with id: %d failed in FLBPluginExitCtx: %s", id, err)
+		errFlag = true
+	}
 
 	if config.client != nil {
-		if err := config.client.Close(); err != nil {
+		if err := awaitShutdownStep(exitCtx, config, id, "Closing managed writer client", config.client.Close); err != nil {
 			log.Printf("Closing managed writer client for output instance with id: %d failed in FLBPluginExitCtx: %s", id, err)
 			errFlag = true
 		}
@@ -311,13 +348,7 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 	// Cancel the instance-scoped context only after pending responses are drained and the streams
 	// and client are closed, so that in-flight AppendRows are not aborted prematurely (which would
 	// cause data loss and terminalize the streams during shutdown).
-	if config.instanceCancel != nil {
-		config.instanceCancel()
-	}
-
-	if errFlag {
-		return output.FLB_ERROR
-	}
+	config.cancelInstance()
 
 	// Release messagePool entries for every writer's descriptor tree so that
 	// the descriptors and their cached *dynamicpb.Message objects can be GC'd.
@@ -325,7 +356,43 @@ func FLBPluginExitCtx(ctx unsafe.Pointer) int {
 		cleanupMsgPool(tw.messageDescriptor)
 	}
 
+	if errFlag {
+		return output.FLB_ERROR
+	}
 	return output.FLB_OK
+}
+
+// awaitShutdownStep runs step and waits for it until exitCtx expires. The managed writer's
+// close paths can wait forever on a connection whose reconnect loop is retrying an unreachable
+// backend; only cancelling the instance context ends that loop. So on expiry the instance
+// context is cancelled and the step is given the same time again to finish. A step that still
+// does not finish is abandoned (the process is exiting anyway). Both cases are reported as an
+// error. Once exitCtx has expired, later steps only get the bounded grace period.
+func awaitShutdownStep(exitCtx context.Context, config *outputConfig, id int, what string, step func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- step() }()
+	timedOut := false
+	if exitCtx.Err() == nil {
+		select {
+		case err := <-done:
+			return err
+		case <-exitCtx.Done():
+		}
+		log.Printf("%s for output instance with id: %d did not finish within %s, cancelling in-flight AppendRows", what, id, config.flushTimeout)
+		timedOut = true
+	}
+	config.cancelInstance()
+	timer := time.NewTimer(config.flushTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err == nil && timedOut {
+			return fmt.Errorf("finished only after %s and cancelling in-flight AppendRows", config.flushTimeout)
+		}
+		return err
+	case <-timer.C:
+		return fmt.Errorf("still blocked %s after cancelling in-flight AppendRows, giving up", config.flushTimeout)
+	}
 }
 
 //export FLBPluginUnregister

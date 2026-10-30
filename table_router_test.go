@@ -125,6 +125,7 @@ func newRouterFixture(t *testing.T, dataset, table string, mutate func(*outputCo
 		requestCountThreshold: requestCountThreshold(queueRequestDefault),
 		dateTimeStringType:    true,
 		flushTimeout:          time.Second,
+		initTimeout:           time.Second,
 		client:                f.client,
 		clock:                 d.clock.clock(),
 		instanceCtx:           ctx,

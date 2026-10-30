@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -144,11 +145,13 @@ func (r *fakeResult) FullResponse(context.Context) (*storagepb.AppendRowsRespons
 
 // fakeStream records AppendRows calls. onAppend, when set, decides the result of each call;
 // otherwise a ready, successful result is returned (or a pending one when pending is true).
+// Close returns io.EOF like the real ManagedStream does on a normal close, unless onClose is set.
 type fakeStream struct {
 	mu        sync.Mutex
 	name      string
 	pending   bool
 	onAppend  func(ctx context.Context, data [][]byte, opts []managedwriter.AppendOption) (appendResult, error)
+	onClose   func() error
 	appends   atomic.Int32
 	closes    atomic.Int32
 	finalizes atomic.Int32
@@ -177,7 +180,16 @@ func (s *fakeStream) AppendRows(ctx context.Context, data [][]byte, opts ...mana
 	return r, nil
 }
 
-func (s *fakeStream) Close() error { s.closes.Add(1); return nil }
+func (s *fakeStream) Close() error {
+	s.closes.Add(1)
+	s.mu.Lock()
+	onClose := s.onClose
+	s.mu.Unlock()
+	if onClose != nil {
+		return onClose()
+	}
+	return io.EOF
+}
 
 func (s *fakeStream) Finalize(context.Context, ...gax.CallOption) (int64, error) {
 	s.finalizes.Add(1)
@@ -199,6 +211,8 @@ func (s *fakeStream) getResultCalls() int32 {
 
 // fakeClient answers GetWriteStream from `schema` (or fails tables listed in failTables) and
 // hands out fakeStreams from NewManagedStream. When `stream` is set every table shares it.
+// blockGet / blockNew, when set, make GetWriteStream / NewManagedStream wait on the channel (or
+// on ctx) first, simulating an unreachable backend.
 type fakeClient struct {
 	mu             sync.Mutex
 	schema         *storagepb.TableSchema
@@ -208,6 +222,8 @@ type fakeClient struct {
 	streams        []*fakeStream
 	newStreamOpts  [][]managedwriter.WriterOption
 	newStreamErr   error
+	blockGet       chan struct{}
+	blockNew       chan struct{}
 	closes         atomic.Int32
 }
 
@@ -224,7 +240,26 @@ func newFakeClient() *fakeClient {
 	}
 }
 
-func (c *fakeClient) NewManagedStream(_ context.Context, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
+// wait blocks until block is closed or ctx expires. A nil block does not wait.
+func wait(ctx context.Context, block chan struct{}) error {
+	if block == nil {
+		return nil
+	}
+	select {
+	case <-block:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *fakeClient) NewManagedStream(ctx context.Context, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
+	c.mu.Lock()
+	block := c.blockNew
+	c.mu.Unlock()
+	if err := wait(ctx, block); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.newStreamOpts = append(c.newStreamOpts, opts)
@@ -239,10 +274,16 @@ func (c *fakeClient) NewManagedStream(_ context.Context, opts ...managedwriter.W
 	return s, nil
 }
 
-func (c *fakeClient) GetWriteStream(_ context.Context, req *storagepb.GetWriteStreamRequest, _ ...gax.CallOption) (*storagepb.WriteStream, error) {
+func (c *fakeClient) GetWriteStream(ctx context.Context, req *storagepb.GetWriteStreamRequest, _ ...gax.CallOption) (*storagepb.WriteStream, error) {
+	c.mu.Lock()
+	c.getWriteStream[req.GetName()]++
+	block := c.blockGet
+	c.mu.Unlock()
+	if err := wait(ctx, block); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.getWriteStream[req.GetName()]++
 	if err, ok := c.failTables[req.GetName()]; ok {
 		return nil, err
 	}

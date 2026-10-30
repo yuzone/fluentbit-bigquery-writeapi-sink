@@ -13,7 +13,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -52,6 +51,9 @@ func TestE2E(t *testing.T) {
 	t.Run("unknown table", h.testUnknownTable)
 	t.Run("unknown table retry", h.testUnknownTableRetry)
 	t.Run("backend outage", h.testBackendOutage)
+	// These two restart Fluent Bit, so they run last.
+	t.Run("shutdown during outage", h.testShutdownDuringOutage)
+	t.Run("startup during outage", h.testStartupDuringOutage)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -126,13 +128,22 @@ func (h *harness) up() {
 	})
 
 	h.compose("up", "-d", "fluent-bit")
-	h.waitFor("fluent-bit in_http listener", func() bool {
-		c, err := net.DialTimeout("tcp", "127.0.0.1:9880", time.Second)
+	h.waitFluentBit()
+}
+
+// waitFluentBit waits until in_http accepts records, which happens only after every output
+// (and so every writeapi instance) has initialized. A plain TCP probe is not enough: Docker's
+// port forwarding accepts connections before the container process listens.
+func (h *harness) waitFluentBit() {
+	h.t.Helper()
+	client := &http.Client{Timeout: 2 * time.Second}
+	h.waitFor("fluent-bit to accept records", func() bool {
+		resp, err := client.Post(httpInput+"/probe", "application/json", strings.NewReader(`[{"message":"probe"}]`))
 		if err != nil {
 			return false
 		}
-		c.Close()
-		return true
+		resp.Body.Close()
+		return resp.StatusCode/100 == 2
 	})
 }
 
@@ -278,6 +289,73 @@ func (h *harness) testBackendOutage(t *testing.T) {
 	h.setProxyEnabled(true)
 	// The blocked append and the redelivered chunk both land: at-least-once duplicates.
 	h.waitCount("outage_logs", 6, rowTimeout)
+}
+
+// Stopping Fluent Bit while an AppendRows call is blocked used to deadlock FLBPluginExitCtx
+// (the managed writer's Close waits for a lock held by the blocked call) until Docker sent
+// SIGKILL. The plugin must now cancel the blocked call and let the process exit cleanly.
+func (h *harness) testShutdownDuringOutage(t *testing.T) {
+	h.setProxyEnabled(false)
+	defer h.setProxyEnabled(true)
+
+	h.send("outage.app", 100, 3)
+	h.waitForLog("AppendRows is blocked", rowTimeout)
+
+	start := time.Now()
+	h.compose("stop", "--timeout", "40", "fluent-bit")
+	elapsed := time.Since(start)
+	if code := h.fluentBitExitCode(); code != 0 {
+		t.Fatalf("fluent-bit exit code = %d (137 means SIGKILL after the stop timeout); logs:\n%s", code, h.fluentBitLogs())
+	}
+	// Grace (5s) + a few seconds for the exit callbacks; a deadlock would use the full 40s.
+	if elapsed > 25*time.Second {
+		t.Fatalf("stopping fluent-bit took %s", elapsed)
+	}
+	if !strings.Contains(h.fluentBitLogs(), "has blocked AppendRows calls, cancelling them before closing") {
+		t.Fatalf("expected the plugin to cancel the blocked append on exit; logs:\n%s", h.fluentBitLogs())
+	}
+}
+
+// Starting Fluent Bit while the backend is unreachable used to block FLBPluginInit for the
+// library's default retry budget (10 minutes). With Init_Timeout_Sec the plugin gives up and
+// Fluent Bit exits with an error, so a process manager can restart it. Afterwards the backend
+// is restored and Fluent Bit is started again to make sure it comes up normally.
+func (h *harness) testStartupDuringOutage(t *testing.T) {
+	before := h.count("static_logs")
+	h.setProxyEnabled(false)
+	h.compose("stop", "--timeout", "40", "fluent-bit")
+	h.compose("up", "-d", "fluent-bit")
+	h.waitFor("fluent-bit to give up on initialization", func() bool {
+		return h.fluentBitExitCode() != -1
+	})
+	if logs := h.fluentBitLogs(); !strings.Contains(logs, "FLBPluginInit") || !strings.Contains(logs, "deadline exceeded") {
+		t.Fatalf("expected initialization to fail with a deadline error; logs:\n%s", h.fluentBitLogs())
+	}
+
+	h.setProxyEnabled(true)
+	h.compose("up", "-d", "fluent-bit")
+	h.waitFluentBit()
+	h.send("static.app", 100, 2)
+	h.waitCount("static_logs", before+2, rowTimeout)
+}
+
+// fluentBitExitCode returns the exit code of the fluent-bit container, or -1 while it runs.
+func (h *harness) fluentBitExitCode() int {
+	h.t.Helper()
+	out := h.compose("ps", "-a", "--format", "json", "fluent-bit")
+	var ps struct {
+		State    string `json:"State"`
+		ExitCode int    `json:"ExitCode"`
+	}
+	// One JSON object per line; only one container matches.
+	line := strings.TrimSpace(strings.Split(strings.TrimSpace(out), "\n")[0])
+	if err := json.Unmarshal([]byte(line), &ps); err != nil {
+		h.t.Fatalf("parsing docker compose ps output %q: %v", out, err)
+	}
+	if ps.State != "exited" {
+		return -1
+	}
+	return ps.ExitCode
 }
 
 // createTable creates dataset.table with the shared e2e schema through the REST API.

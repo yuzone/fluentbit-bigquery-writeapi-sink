@@ -40,6 +40,7 @@ const (
 	dateTimeDefault            = true
 	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC; values above this are treated as already in microseconds
 	flushTimeoutSecDefault     = 10         // default Flush_Timeout_Sec: 10 seconds per flush call
+	initTimeoutSecDefault      = 30         // default Init_Timeout_Sec: schema fetch + stream creation per table
 	tagDelimitersDefault       = "."        // default Tag_Delimiters used to split the tag for $TAG[n]
 	retryOnFailureDefault      = true       // default Retry_On_Failure: return FLB_RETRY for transient append failures
 	enableMultiplexingDefault  = false      // default Enable_Multiplexing: one gRPC connection per default stream
@@ -85,6 +86,7 @@ type outputConfig struct {
 	requestCountThreshold int
 	dateTimeStringType    bool
 	flushTimeout          time.Duration
+	initTimeout           time.Duration
 	retryOnFailure        bool
 	enableMultiplexing    bool
 	multiplexPoolLimit    int
@@ -192,6 +194,15 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 	}
 	cfg.flushTimeout = time.Duration(flushTimeoutSec) * time.Second
 
+	initTimeoutSec, err := getConfigField(flb, plugin, "Init_Timeout_Sec", initTimeoutSecDefault)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid Init_Timeout_Sec parameter in configuration file: %w", err)
+	}
+	if initTimeoutSec < 1 {
+		return nil, fmt.Errorf("Invalid Init_Timeout_Sec parameter in configuration file: must be >= 1, got %d", initTimeoutSec)
+	}
+	cfg.initTimeout = time.Duration(initTimeoutSec) * time.Second
+
 	if cfg.retryOnFailure, err = getConfigField(flb, plugin, "Retry_On_Failure", retryOnFailureDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Retry_On_Failure parameter in configuration file: %w", err)
 	}
@@ -251,4 +262,11 @@ func (cfg *outputConfig) clientOptions() []option.ClientOption {
 		)
 	}
 	return opts
+}
+
+// cancelInstance cancels the instance-scoped context. It is safe to call more than once.
+func (c *outputConfig) cancelInstance() {
+	if c.instanceCancel != nil {
+		c.instanceCancel()
+	}
 }

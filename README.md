@@ -109,14 +109,15 @@ Keys are matched case-insensitively by Fluent Bit.
 | `TableId` | string | (required) | BigQuery table. May contain `$TAG` / `$TAG[n]`. Without placeholders the schema is fetched once at startup and a missing table fails initialisation. |
 | `Tag_Delimiters` | string | `.` | Characters on which the tag is split for `$TAG[n]`. Every character in the value is a delimiter; empty parts are dropped. |
 | `Preload_Tables` | string | *(empty)* | Comma-separated table IDs to initialise at startup when `TableId` is tag-based. A missing preload table fails initialisation, restoring the start-up validation a static `TableId` provides. Requires a static `DatasetId`. |
-| `Unknown_Table_Action` | string | `drop` | What to do with a chunk whose table cannot be resolved or initialised: `drop` logs and acknowledges the chunk (`FLB_OK`); `retry` returns `FLB_RETRY` so Fluent Bit redelivers it. |
+| `Unknown_Table_Action` | string | `drop` | What to do with a chunk whose table cannot be resolved or initialised: `drop` logs and acknowledges the chunk (`FLB_OK`); `retry` returns `FLB_RETRY` so Fluent Bit redelivers it. A **transient** initialisation failure (backend unreachable, `Init_Timeout_Sec` exceeded) is not an unknown table: it is retried like a transient append failure regardless of this setting. |
 | `Exactly_Once` | bool | `false` | `true` uses a committed stream with synchronous response checking (exactly-once). `false` uses the default stream with asynchronous response checking (at-least-once). |
 | `Num_Synchronous_Retries` | int | `4` | Maximum synchronous retries per append when `Exactly_Once` is `true`. Ignored otherwise. |
 | `Max_Chunk_Size` | int (bytes) | `9437184` (9 MiB) | Upper bound on the serialized size of a single `AppendRows` request. Values above 9 MiB are clamped to 9 MiB. |
 | `Max_Queue_Requests` | int | `1000` | Maximum number of in-flight (unacknowledged) `AppendRows` requests per stream. When the queue reaches 80 % of this value a new default stream is created (up to 10 streams per output instance). |
 | `Max_Queue_Bytes` | int (bytes) | `104857600` (100 MiB) | Maximum number of in-flight bytes per stream. |
 | `DateTime_String_Type` | bool | `true` | `true` accepts `DATETIME` values as strings. `false` accepts civil-time encoded `int64`. Applies to nested `DATETIME` fields as well; `RANGE<DATETIME>` always expects `int64`. |
-| `Flush_Timeout_Sec` | int (seconds) | `10` | Deadline for a single flush call (and for draining pending responses on exit). An `AppendRows` call that has not returned by then is left running in the background and the chunk is reported as `FLB_RETRY` (see [Delivery semantics](#delivery-semantics)). |
+| `Flush_Timeout_Sec` | int (seconds) | `10` | Deadline for a single flush call (and for each step of the shutdown, see [Shutdown](#shutdown)). An `AppendRows` call that has not returned by then is left running in the background and the chunk is reported as `FLB_RETRY` (see [Delivery semantics](#delivery-semantics)). |
+| `Init_Timeout_Sec` | int (seconds) | `30` | Deadline for initialising one table (schema fetch and stream creation). Without it the client library retries an unreachable backend for 10 minutes, blocking Fluent Bit's start-up (static table) or the first flush of a tag-routed table. Must be ≥ 1. |
 | `Retry_On_Failure` | bool | `true` | `true` returns `FLB_RETRY` / `FLB_ERROR` to Fluent Bit when an append fails (see [Delivery semantics](#delivery-semantics)). `false` restores the historical behaviour of logging the failure and acknowledging the chunk. |
 | `Enable_Multiplexing` | bool | `false` | **EXPERIMENTAL.** Share gRPC connections between default streams of this output (see [Connection multiplexing](#connection-multiplexing)). |
 | `Multiplex_Pool_Limit` | int | `1` | **EXPERIMENTAL.** Maximum shared connections per BigQuery region when `Enable_Multiplexing` is `true`; ignored otherwise. Must be `>= 1`. |
@@ -162,12 +163,13 @@ Behaviour:
   range are treated as unknown tables and never reach BigQuery.
 - A failed initialisation (for example `NOT_FOUND` for a mistyped tag) is
   remembered for 60 s so a bad tag does not call `GetWriteStream` on every
-  flush.
+  flush. Transient failures (backend unreachable) are not remembered; the next
+  flush tries again.
 - `Max_Queue_Requests`, `Max_Queue_Bytes` and dynamic stream scaling (up to 10
   streams) apply **per table**, as they did per output before. Fluent Bit's
   own buffer limits (`storage.total_limit_size`, `Mem_Buf_Limit`) remain per
   output, so keep very high-volume tables on dedicated outputs.
-- Shutdown drains and closes every table's streams.
+- Shutdown drains and closes every table's streams (see [Shutdown](#shutdown)).
 
 ## Accepted input type per BigQuery field type
 
@@ -225,7 +227,9 @@ Which failures are visible at flush time depends on the mode:
   appended again, so **one chunk per table and outage is duplicated**. Size
   Fluent Bit's buffer (`storage.*`, `Mem_Buf_Limit`, `Retry_Limit`) for the
   outages you want to survive. Verified by the `backend outage` scenario of
-  the [end-to-end harness](#end-to-end-harness).
+  the [end-to-end harness](#end-to-end-harness). Initialising a table while the
+  backend is unreachable fails after `Init_Timeout_Sec` and is treated the same
+  way (`FLB_RETRY`, not `Unknown_Table_Action`).
 - **Committed stream (`Exactly_Once true`)**: every append is confirmed
   synchronously and retried up to `Num_Synchronous_Retries` times for
   transient errors before the chunk is reported as `FLB_RETRY`.
@@ -241,6 +245,37 @@ remaining requests.
 Records that cannot be converted to the table schema on the client side are
 logged and skipped individually; retrying would not help, so they never
 influence the return code.
+
+## Shutdown
+
+On `FLBPluginExitCtx` the plugin, per output instance:
+
+1. waits up to `Flush_Timeout_Sec` for the pending responses of
+   already-acknowledged appends (default stream),
+2. closes every stream,
+3. closes the client,
+4. cancels the instance context.
+
+While the backend is unreachable the client library's close paths wait on the
+same connection lock that the blocked reconnect loop holds, so step 2 would
+never return. To keep shutdown bounded the plugin cancels the instance context
+*before* step 2 when an `AppendRows` call is known to be blocked (see above),
+and otherwise whenever a step exceeds `Flush_Timeout_Sec`; a cancelled step is
+then given another `Flush_Timeout_Sec` before it is abandoned. Acknowledged
+appends are drained in step 1 and blocked chunks were already reported as
+`FLB_RETRY`, so cancelling loses nothing on the plugin side: whether the
+retried chunks survive the restart depends on Fluent Bit's buffer
+(`storage.type filesystem`). Responses still outstanding for acknowledged
+appends after step 1 cannot be waited for and are lost, as they would be with
+any restart during an outage. A step that had to be cancelled because it
+exceeded the deadline is logged and reported as `FLB_ERROR`. Verified by the
+`shutdown during outage` scenario of the
+[end-to-end harness](#end-to-end-harness).
+
+Plan Fluent Bit's `Grace` and the process manager's stop timeout for roughly
+`Grace + 4 × Flush_Timeout_Sec` per output in the worst case (one shared
+deadline plus one grace period for each of the three steps); a healthy
+shutdown takes well under a second per output.
 
 ## Backpressure and buffering
 
@@ -326,9 +361,12 @@ make e2e-down     # tears down a stack kept with E2E_KEEP=1
 Scenarios (`hack/e2e/e2e_test.go`): static table, `$TAG[n]` routing to several
 tables, unknown table with `Unknown_Table_Action drop`, unknown table with
 `Unknown_Table_Action retry` (the table is created while Fluent Bit retries the
-chunk), and a backend outage simulated with a
+chunk), a backend outage simulated with a
 [toxiproxy](https://github.com/Shopify/toxiproxy) in front of the emulator
-(`FLB_RETRY` after `Flush_Timeout_Sec`, redelivery once the backend is back).
+(`FLB_RETRY` after `Flush_Timeout_Sec`, redelivery once the backend is back),
+stopping Fluent Bit during that outage (`docker compose stop` exits cleanly
+within `Grace` plus a few seconds instead of being killed), and starting Fluent
+Bit during the outage (initialisation fails after `Init_Timeout_Sec`).
 Set `E2E_KEEP=1` to leave the stack running after a failure for inspection
 (`docker compose -f hack/e2e/docker-compose.yml logs fluent-bit`).
 
