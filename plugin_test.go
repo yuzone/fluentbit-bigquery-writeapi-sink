@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 	"unsafe"
 
 	"cloud.google.com/go/bigquery/storage/managedwriter"
@@ -160,6 +161,76 @@ func TestFLBPluginFlushCtxPermanentFailureContinues(t *testing.T) {
 
 	assert.Equal(t, output.FLB_ERROR, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
 	assert.Equal(t, int32(3), f.appendCalls())
+}
+
+// An AppendRows call that does not return within the flush timeout (unreachable backend or a
+// saturated in-flight queue) must surface as FLB_RETRY instead of blocking the flush forever.
+// Until the blocked call completes, further flushes for the table fail fast without starting
+// another append; afterwards appends resume and the late result is queued for checking.
+func TestFLBPluginFlushCtxBlockedAppendReturnsRetry(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.retryOnFailure = true
+		c.flushTimeout = 50 * time.Millisecond
+	})
+	require.NoError(t, f.router.init())
+	release := make(chan struct{})
+	lateResult := readyResult(-1, nil)
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		select {
+		case <-release:
+			return lateResult, nil
+		case <-ctx.Done():
+			t.Error("the blocked append must keep running on the instance context")
+			return nil, ctx.Err()
+		}
+	})
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "hello"})
+	tw := f.router.static
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, int32(1), f.appendCalls())
+	assert.Equal(t, int32(1), tw.blockedAppends.Load())
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")), "fails fast while blocked")
+	assert.Equal(t, int32(1), f.appendCalls(), "no new append is started while one is blocked")
+
+	close(release)
+	require.Eventually(t, func() bool { return tw.blockedAppends.Load() == 0 }, time.Second, time.Millisecond)
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) { return readyResult(-1, nil), nil })
+
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, int32(2), f.appendCalls())
+	assert.Equal(t, int32(1), lateResult.getCalls.Load(), "the late result is queued and checked on the next flush")
+}
+
+// Exactly-once: when a blocked append completes after the flush gave up, the rows sit at the
+// offset that was used, so the counter must advance before the redelivered chunk is appended.
+func TestFLBPluginFlushCtxBlockedAppendExactlyOnceAdvancesOffset(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.retryOnFailure = true
+		c.exactlyOnce = true
+		c.streamType = managedwriter.CommittedStream
+		c.numRetries = 3
+		c.flushTimeout = 50 * time.Millisecond
+	})
+	require.NoError(t, f.router.init())
+	release := make(chan struct{})
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		<-release
+		return readyResult(0, nil), nil
+	})
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"}, map[string]interface{}{"Text": "b"})
+	tw := f.router.static
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, int32(1), f.appendCalls(), "blocked appends are not retried synchronously")
+	assert.Equal(t, int64(0), tw.offset())
+
+	close(release)
+	require.Eventually(t, func() bool { return tw.offset() == 2 }, time.Second, time.Millisecond)
+	assert.Equal(t, int32(0), tw.blockedAppends.Load())
 }
 
 // In exactly-once mode the synchronous GetResult error (after the configured retries) decides

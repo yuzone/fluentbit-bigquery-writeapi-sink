@@ -263,19 +263,21 @@ func (h *harness) testUnknownTableRetry(t *testing.T) {
 
 // testBackendOutage disables the proxy between the plugin and the emulator: the connection is
 // dropped and reconnects are refused. The managed writer retries the reconnect internally for as
-// long as the outage lasts (AppendRows blocks rather than failing, see README "Delivery
-// semantics"), so nothing is lost and the rows arrive once the backend is back. The emulator
+// long as the outage lasts, so AppendRows blocks; the plugin gives up after Flush_Timeout_Sec,
+// returns FLB_RETRY and Fluent Bit redelivers the chunk until the backend is back. The emulator
 // itself stays up, so the seeded tables and the REST port used by count are unaffected.
 func (h *harness) testBackendOutage(t *testing.T) {
 	h.setProxyEnabled(false)
 	defer h.setProxyEnabled(true)
 
 	h.send("outage.app", 0, 3)
-	time.Sleep(6 * time.Second)
+	h.waitForLog("AppendRows is blocked", rowTimeout)
+	h.waitForLog("output=writeapi.3", rowTimeout) // Fluent Bit scheduled a retry for this output
 	h.assertStableCount("outage_logs", 0)
 
 	h.setProxyEnabled(true)
-	h.waitCount("outage_logs", 3, rowTimeout)
+	// The blocked append and the redelivered chunk both land: at-least-once duplicates.
+	h.waitCount("outage_logs", 6, rowTimeout)
 }
 
 // createTable creates dataset.table with the shared e2e schema through the REST API.

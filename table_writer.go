@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
@@ -57,7 +59,17 @@ type tableWriter struct {
 
 	streamMu sync.Mutex // guards streams and its elements (streamConfig)
 	streams  []*streamConfig
+
+	// blockedAppends counts AppendRows calls that did not return within the flush timeout and
+	// are still running in the background (see appendRows). While it is non-zero every flush
+	// for this table fails fast with errAppendBlocked instead of starting another append.
+	blockedAppends atomic.Int32
 }
+
+// errAppendBlocked is returned (wrapped) when AppendRows does not return within the flush
+// timeout, and for every flush of that table until the blocked call completes. It is treated
+// as transient so that Fluent Bit keeps the chunk and retries.
+var errAppendBlocked = errors.New("AppendRows is blocked, the backend is probably unreachable")
 
 // newTableWriter fetches the table schema and opens the first managed stream.
 // ctx must be the instance-scoped context: it is retained for AppendRows and stream
@@ -371,7 +383,21 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 
 	currStream := tw.streams[streamIndex]
 
-	result, err := currStream.managedstream.AppendRows(ctx, data, managedwriter.WithOffset(currStream.offsetCounter))
+	// If the append completes after the flush timed out, the rows have been written at this
+	// offset; advance the counter so the chunk redelivered by Fluent Bit lands at the next one.
+	late := func(result appendResult, err error) {
+		if err != nil {
+			return
+		}
+		if _, err := getResult(result, tw.ctx); err != nil {
+			log.Printf("Blocked exactly-once append to table %s for output instance with id: %d was rejected: %s", tw.tableRef, tw.id, err)
+			return
+		}
+		tw.streamMu.Lock()
+		defer tw.streamMu.Unlock()
+		currStream.offsetCounter += int64(len(data))
+	}
+	result, err := tw.appendRows(ctx, currStream, data, late, managedwriter.WithOffset(currStream.offsetCounter))
 	if err != nil {
 		return err
 	}
@@ -399,6 +425,11 @@ func (tw *tableWriter) sendRequestRetries(ctx context.Context, data [][]byte, st
 			break
 		}
 		// Unsuccessful data append
+		if errors.Is(err, errAppendBlocked) {
+			// Retrying within this flush would only block again or fail fast; hand the chunk
+			// back to Fluent Bit.
+			return err
+		}
 		if rebuildPredicate(err) {
 			// Hold streamMu while closing and rebuilding the stream so no concurrent
 			// worker (workers > 1) can observe a partially-closed or replaced stream.
@@ -430,18 +461,24 @@ func (tw *tableWriter) sendRequestRetries(ctx context.Context, data [][]byte, st
 // sendRequestDefault sends data through a default stream and queues the response to be checked
 // asynchronously (at-least-once). The append uses the instance-scoped context (tw.ctx), not the
 // per-flush ctx, so the managed writer's internal retry/reconnect for this asynchronously-acknowledged
-// append is not aborted when the flush context is canceled at flush end. Because tw.ctx has no
-// per-append deadline, the only backpressure bound is the managed writer's inflight limit
-// (Max_Queue_Requests / Max_Queue_Bytes); on saturation AppendRows blocks rather than timing out,
-// which surfaces as a blocking flush absorbed by Fluent Bit's (filesystem) buffer.
-func (tw *tableWriter) sendRequestDefault(data [][]byte, streamIndex int) error {
+// append is not aborted when the flush context is canceled at flush end. The per-flush ctx only
+// bounds how long this flush waits for AppendRows to return (see appendRows): on a saturated
+// inflight queue (Max_Queue_Requests / Max_Queue_Bytes) or an unreachable backend the flush is
+// reported as transient instead of blocking the output worker.
+func (tw *tableWriter) sendRequestDefault(ctx context.Context, data [][]byte, streamIndex int) error {
 	// Hold streamMu only for the slice access; AppendRows is goroutine-safe inside
 	// the managed writer and must not be called under the lock to avoid blocking all
 	// concurrent flushes when the inflight queue (Max_Queue_Requests / Max_Queue_Bytes)
 	// is saturated.
 	currStream := tw.getStream(streamIndex)
 
-	result, err := currStream.managedstream.AppendRows(tw.ctx, data)
+	// An append that completes after the flush timed out still needs its response checked.
+	late := func(result appendResult, err error) {
+		if err == nil {
+			tw.queueResult(currStream, result)
+		}
+	}
+	result, err := tw.appendRows(ctx, currStream, data, late)
 	if err != nil {
 		return err
 	}
@@ -450,17 +487,62 @@ func (tw *tableWriter) sendRequestDefault(data [][]byte, streamIndex int) error 
 	return nil
 }
 
+type appendOutcome struct {
+	result appendResult
+	err    error
+}
+
+// appendRows calls AppendRows on stream with the instance context and waits for it to return or
+// for ctx (the per-flush deadline) to expire.
+//
+// While the backend is unreachable the managed writer re-opens its gRPC stream indefinitely
+// (UNAVAILABLE is retried without an attempt limit and the request context is not consulted),
+// so AppendRows blocks for the whole outage instead of failing. The same happens when the
+// in-flight queue (Max_Queue_Requests / Max_Queue_Bytes) is saturated. On expiry the call is
+// left running in the background: its rows are written once the backend answers and late
+// receives its outcome. Until then flush fails fast with errAppendBlocked, so Fluent Bit
+// redelivers the chunk (FLB_RETRY) without piling up more blocked appends. The redelivered
+// chunk is appended again after the blocked one completes, which is the usual
+// at-least-once duplicate.
+func (tw *tableWriter) appendRows(ctx context.Context, stream *streamConfig, data [][]byte, late func(appendResult, error), opts ...managedwriter.AppendOption) (appendResult, error) {
+	done := make(chan appendOutcome, 1)
+	started := time.Now()
+	go func() {
+		result, err := stream.managedstream.AppendRows(tw.ctx, data, opts...)
+		done <- appendOutcome{result: result, err: err}
+	}()
+
+	select {
+	case o := <-done:
+		return o.result, o.err
+	case <-ctx.Done():
+	}
+
+	tw.blockedAppends.Add(1)
+	go func() {
+		o := <-done
+		log.Printf("Blocked append of %d rows to table %s for output instance with id: %d returned after %s (error: %v); resuming appends", len(data), tw.tableRef, tw.id, time.Since(started).Round(time.Millisecond), o.err)
+		// Record the outcome before appends resume so that the next flush sees it.
+		late(o.result, o.err)
+		tw.blockedAppends.Add(-1)
+	}()
+	return nil, fmt.Errorf("%w: AppendRows did not return within %s (%d rows left in flight)", errAppendBlocked, time.Since(started).Round(time.Millisecond), len(data))
+}
+
 // flush picks the least-loaded stream and sends data through it, using the exactly-once or
 // at-least-once path according to the configuration.
 func (tw *tableWriter) flush(ctx context.Context, data [][]byte) error {
 	if len(data) == 0 {
 		return nil
 	}
+	if n := tw.blockedAppends.Load(); n > 0 {
+		return fmt.Errorf("%w: %d append(s) still in flight", errAppendBlocked, n)
+	}
 	streamIndex := tw.leastLoadedStreamIndex()
 	if tw.cfg.exactlyOnce {
 		return tw.sendRequestRetries(ctx, data, streamIndex)
 	}
-	return tw.sendRequestDefault(data, streamIndex)
+	return tw.sendRequestDefault(ctx, data, streamIndex)
 }
 
 // getLeastLoadedStream finds the stream index with the shortest response queue. Caller must hold streamMu.

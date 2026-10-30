@@ -116,7 +116,7 @@ Keys are matched case-insensitively by Fluent Bit.
 | `Max_Queue_Requests` | int | `1000` | Maximum number of in-flight (unacknowledged) `AppendRows` requests per stream. When the queue reaches 80 % of this value a new default stream is created (up to 10 streams per output instance). |
 | `Max_Queue_Bytes` | int (bytes) | `104857600` (100 MiB) | Maximum number of in-flight bytes per stream. |
 | `DateTime_String_Type` | bool | `true` | `true` accepts `DATETIME` values as strings. `false` accepts civil-time encoded `int64`. Applies to nested `DATETIME` fields as well; `RANGE<DATETIME>` always expects `int64`. |
-| `Flush_Timeout_Sec` | int (seconds) | `10` | Deadline for a single flush call (and for draining pending responses on exit). |
+| `Flush_Timeout_Sec` | int (seconds) | `10` | Deadline for a single flush call (and for draining pending responses on exit). An `AppendRows` call that has not returned by then is left running in the background and the chunk is reported as `FLB_RETRY` (see [Delivery semantics](#delivery-semantics)). |
 | `Retry_On_Failure` | bool | `true` | `true` returns `FLB_RETRY` / `FLB_ERROR` to Fluent Bit when an append fails (see [Delivery semantics](#delivery-semantics)). `false` restores the historical behaviour of logging the failure and acknowledging the chunk. |
 | `Enable_Multiplexing` | bool | `false` | **EXPERIMENTAL.** Share gRPC connections between default streams of this output (see [Connection multiplexing](#connection-multiplexing)). |
 | `Multiplex_Pool_Limit` | int | `1` | **EXPERIMENTAL.** Maximum shared connections per BigQuery region when `Enable_Multiplexing` is `true`; ignored otherwise. Must be `>= 1`. |
@@ -214,14 +214,18 @@ Which failures are visible at flush time depends on the mode:
   **logged only** (`Encountered error ... while verifying the server
   response`). The managed writer retries transient failures internally for
   this path.
-- **Backend outage (both modes)**: while the endpoint is unreachable the
-  managed writer keeps retrying to open the gRPC stream (`UNAVAILABLE`) for as
-  long as the output instance lives, so `AppendRows` **blocks** rather than
-  failing and the flush does not return until connectivity is back. Nothing is
-  lost: the chunk is written once the backend is reachable again. Size Fluent
-  Bit's buffer (`storage.*`, `Mem_Buf_Limit`) for the outages you want to
-  survive, since no `FLB_RETRY` is produced in this situation. Verified by the
-  `backend outage` scenario of the [end-to-end harness](#end-to-end-harness).
+- **Blocked append (both modes)**: while the endpoint is unreachable the
+  managed writer re-opens the gRPC stream indefinitely (`UNAVAILABLE` is
+  retried without limit), and when the in-flight queue is saturated it waits
+  for room, so `AppendRows` **blocks** instead of failing. The plugin waits at
+  most `Flush_Timeout_Sec`, then returns `FLB_RETRY` and leaves the call
+  running in the background; until it completes, every flush for that table
+  returns `FLB_RETRY` immediately without starting another append. When the
+  backend answers, the blocked rows are written and the redelivered chunk is
+  appended again, so **one chunk per table and outage is duplicated**. Size
+  Fluent Bit's buffer (`storage.*`, `Mem_Buf_Limit`, `Retry_Limit`) for the
+  outages you want to survive. Verified by the `backend outage` scenario of
+  the [end-to-end harness](#end-to-end-harness).
 - **Committed stream (`Exactly_Once true`)**: every append is confirmed
   synchronously and retried up to `Num_Synchronous_Retries` times for
   transient errors before the chunk is reported as `FLB_RETRY`.
@@ -248,6 +252,10 @@ synchronously, so the queue never grows beyond a single flush.
 Backpressure towards inputs is handled by Fluent Bit's own buffering
 (`Mem_Buf_Limit`, `storage.type filesystem`); see
 [Buffering & Storage](https://docs.fluentbit.io/manual/administration/buffering-and-storage).
+A flush whose `AppendRows` call stays blocked for `Flush_Timeout_Sec` (all
+streams saturated, or the backend unreachable) is reported as `FLB_RETRY` and
+redelivered later rather than blocking the output worker; see
+[Delivery semantics](#delivery-semantics).
 
 ### Connection multiplexing
 
@@ -319,7 +327,8 @@ Scenarios (`hack/e2e/e2e_test.go`): static table, `$TAG[n]` routing to several
 tables, unknown table with `Unknown_Table_Action drop`, unknown table with
 `Unknown_Table_Action retry` (the table is created while Fluent Bit retries the
 chunk), and a backend outage simulated with a
-[toxiproxy](https://github.com/Shopify/toxiproxy) in front of the emulator.
+[toxiproxy](https://github.com/Shopify/toxiproxy) in front of the emulator
+(`FLB_RETRY` after `Flush_Timeout_Sec`, redelivery once the backend is back).
 Set `E2E_KEEP=1` to leave the stack running after a failure for inspection
 (`docker compose -f hack/e2e/docker-compose.yml logs fluent-bit`).
 
