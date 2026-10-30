@@ -832,6 +832,32 @@ func TestFLBPluginFlushCtxExactlyOnceRebuildsInvalidStream(t *testing.T) {
 	assert.Empty(t, f.clock.sleeps, "the rebuild does not count as a retry attempt")
 }
 
+// A rebuilt stream that is rejected the same way is not rebuilt again within the flush: the
+// INVALID_ARGUMENT status is returned as is and is a permanent failure.
+func TestFLBPluginFlushCtxExactlyOnceRebuildsOnlyOncePerFlush(t *testing.T) {
+	f := newExactlyOnceFixture(t, nil)
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"})
+	tw := f.router.static
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		return readyResult(-1, invalidStreamTypeErr(t)), nil
+	})
+	rejected := &fakeStream{}
+	rejected.onAppend = f.stream.onAppend
+	f.client.mu.Lock()
+	f.client.stream = rejected
+	f.client.mu.Unlock()
+
+	assert.Equal(t, output.FLB_ERROR, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, 2, f.client.newStreamCalls(), "only one rebuild per flush")
+	assert.Equal(t, int32(1), f.stream.appends.Load())
+	assert.Equal(t, int32(1), rejected.appends.Load())
+	assert.Same(t, rejected, currentStream(tw), "the rebuilt stream stays in place")
+	assert.Equal(t, int32(0), rejected.closes.Load())
+	assert.Equal(t, int64(0), tw.offset())
+	assert.Empty(t, f.clock.sleeps)
+}
+
 // When the rebuild itself fails (backend unreachable past Init_Timeout_Sec) the closed stream
 // must not stay in place: the flush is transient, the table has no stream until the next flush
 // rebuilds it, and that flush succeeds on the new stream once the backend is back.

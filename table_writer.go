@@ -528,8 +528,9 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 // An append rejected with INVALID_STREAM_TYPE (or made while the stream has no usable managed
 // stream) triggers rebuildStream and is retried once on the new stream without counting as an
 // attempt. At most one rebuild is performed per flush so that a backend that keeps rejecting
-// the new stream cannot keep this flush looping; the error is reported instead and Fluent Bit
-// redelivers the chunk.
+// the new stream cannot keep this flush looping: the second rejection is returned as is, and
+// being INVALID_ARGUMENT it is a permanent failure (the chunk is dropped with FLB_ERROR, or
+// only logged when Retry_On_Failure is off). The next flush rebuilds the stream again.
 func (tw *tableWriter) sendRequestRetries(ctx context.Context, data [][]byte, streamIndex int) error {
 	retryer := newStatelessRetryer(tw.cfg.numRetries)
 	attempt := 0
