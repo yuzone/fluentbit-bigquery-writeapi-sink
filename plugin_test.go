@@ -22,6 +22,7 @@ import (
 	"time"
 	"unsafe"
 
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
 	"github.com/fluent/fluent-bit-go/output"
@@ -70,6 +71,7 @@ func TestIsTransientError(t *testing.T) {
 		{"context deadline", context.DeadlineExceeded, true},
 		{"wrapped context canceled", errors.Join(errors.New("append"), context.Canceled), true},
 		{"eof", io.EOF, true},
+		{"stream rebuilding", errors.Join(errors.New("flush"), errStreamRebuilding), true},
 		{"net error", &net.OpError{Op: "dial", Err: errors.New("refused")}, true},
 		{"invalid argument", status.Error(codes.InvalidArgument, "schema mismatch"), false},
 		{"permission denied", status.Error(codes.PermissionDenied, "x"), false},
@@ -736,6 +738,217 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
 	assert.Equal(t, int64(5), getOffset(id))
 	assert.Equal(t, int32(4), stream.appends.Load())
+}
+
+// invalidStreamTypeErr builds the AppendRows rejection that means the committed stream itself
+// is invalid: an INVALID_ARGUMENT status carrying a StorageError INVALID_STREAM_TYPE detail.
+func invalidStreamTypeErr(t *testing.T) error {
+	t.Helper()
+	st, err := status.New(codes.InvalidArgument, "invalid stream").WithDetails(
+		&storagepb.StorageError{Code: storagepb.StorageError_INVALID_STREAM_TYPE})
+	require.NoError(t, err)
+	return st.Err()
+}
+
+func TestRebuildPredicate(t *testing.T) {
+	otherDetail, err := status.New(codes.InvalidArgument, "x").WithDetails(
+		&storagepb.StorageError{Code: storagepb.StorageError_STREAM_NOT_FOUND})
+	require.NoError(t, err)
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"invalid stream type detail", invalidStreamTypeErr(t), true},
+		{"other storage error detail", otherDetail.Err(), false},
+		{"status without details", status.Error(codes.InvalidArgument, "x"), false},
+		{"plain error", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, rebuildPredicate(tt.err))
+		})
+	}
+}
+
+// currentStream returns the managed stream at index 0 under streamMu (nil while rebuilding).
+func currentStream(tw *tableWriter) MWManagedStream {
+	tw.streamMu.Lock()
+	defer tw.streamMu.Unlock()
+	return tw.streams[0].managedstream
+}
+
+// newExactlyOnceFixture returns an initialised exactly-once fixture whose NewManagedStream hands
+// out a distinct fakeStream per call from now on, so a rebuilt stream can be told apart from the
+// initial one (f.stream).
+func newExactlyOnceFixture(t *testing.T, mutate func(*outputConfig)) *routerFixture {
+	t.Helper()
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.retryOnFailure = true
+		c.exactlyOnce = true
+		c.streamType = managedwriter.CommittedStream
+		c.numRetries = 0
+		if mutate != nil {
+			mutate(c)
+		}
+	})
+	require.NoError(t, f.router.init())
+	f.client.mu.Lock()
+	f.client.stream = nil
+	f.client.mu.Unlock()
+	return f
+}
+
+// An append rejected with INVALID_STREAM_TYPE replaces the committed stream: the old one is
+// finalized and closed, the chunk is appended to the new one within the same flush, and the
+// offset counter restarts at 0 because a new committed stream does.
+func TestFLBPluginFlushCtxExactlyOnceRebuildsInvalidStream(t *testing.T) {
+	f := newExactlyOnceFixture(t, nil)
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"}, map[string]interface{}{"Text": "b"})
+	tw := f.router.static
+	rejections := 0
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		if rejections == 0 {
+			return readyResult(0, nil), nil
+		}
+		return readyResult(-1, invalidStreamTypeErr(t)), nil
+	})
+
+	require.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	require.Equal(t, int64(2), tw.offset())
+	rejections++
+
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, int32(2), f.stream.appends.Load())
+	assert.Equal(t, int32(1), f.stream.finalizes.Load(), "the invalid stream is finalized")
+	assert.Equal(t, int32(1), f.stream.closes.Load(), "the invalid stream is closed")
+	require.Len(t, f.client.streams, 2, "one stream is rebuilt")
+	rebuilt := f.client.streams[1]
+	assert.Same(t, rebuilt, currentStream(tw))
+	assert.Equal(t, int32(1), rebuilt.appends.Load(), "the chunk is appended to the new stream in the same flush")
+	assert.Equal(t, int64(2), tw.offset(), "the offset restarts at 0 on the new stream")
+	assert.Empty(t, f.clock.sleeps, "the rebuild does not count as a retry attempt")
+}
+
+// A rebuilt stream that is rejected the same way is not rebuilt again within the flush: the
+// INVALID_ARGUMENT status is returned as is and is a permanent failure.
+func TestFLBPluginFlushCtxExactlyOnceRebuildsOnlyOncePerFlush(t *testing.T) {
+	f := newExactlyOnceFixture(t, nil)
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"})
+	tw := f.router.static
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		return readyResult(-1, invalidStreamTypeErr(t)), nil
+	})
+	rejected := &fakeStream{}
+	rejected.onAppend = f.stream.onAppend
+	f.client.mu.Lock()
+	f.client.stream = rejected
+	f.client.mu.Unlock()
+
+	assert.Equal(t, output.FLB_ERROR, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, 2, f.client.newStreamCalls(), "only one rebuild per flush")
+	assert.Equal(t, int32(1), f.stream.appends.Load())
+	assert.Equal(t, int32(1), rejected.appends.Load())
+	assert.Same(t, rejected, currentStream(tw), "the rebuilt stream stays in place")
+	assert.Equal(t, int32(0), rejected.closes.Load())
+	assert.Equal(t, int64(0), tw.offset())
+	assert.Empty(t, f.clock.sleeps)
+}
+
+// When the rebuild itself fails (backend unreachable past Init_Timeout_Sec) the closed stream
+// must not stay in place: the flush is transient, the table has no stream until the next flush
+// rebuilds it, and that flush succeeds on the new stream once the backend is back.
+func TestFLBPluginFlushCtxExactlyOnceRebuildFailureRecovers(t *testing.T) {
+	f := newExactlyOnceFixture(t, func(c *outputConfig) { c.initTimeout = 100 * time.Millisecond })
+	block := blockNewStreams(f.client)
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"})
+	tw := f.router.static
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		return readyResult(-1, invalidStreamTypeErr(t)), nil
+	})
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, int32(1), f.stream.closes.Load())
+	assert.Nil(t, currentStream(tw), "the closed stream is not left in place")
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")), "still unreachable")
+	assert.Equal(t, int32(1), f.stream.appends.Load(), "the closed stream is never appended to again")
+	assert.Equal(t, int32(1), f.stream.closes.Load(), "and not closed twice")
+
+	close(block)
+	require.Eventually(t, func() bool { return f.client.newStreamCalls() == 3 }, time.Second, time.Millisecond,
+		"the two timed-out creations complete in the background")
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	require.Equal(t, 4, f.client.newStreamCalls(), "init, two timed-out rebuilds, one successful rebuild")
+	rebuilt := f.client.streams[3]
+	assert.Same(t, rebuilt, currentStream(tw))
+	assert.Equal(t, int32(1), rebuilt.appends.Load())
+	assert.Equal(t, int64(1), tw.offset())
+	for _, late := range f.client.streams[1:3] {
+		require.Eventually(t, func() bool { return late.closes.Load() == 1 }, time.Second, time.Millisecond,
+			"streams created after the deadline are closed")
+	}
+}
+
+// Finalize/Close/NewManagedStream of a rebuild run outside streamMu: a concurrent flush of the
+// same table (workers > 1) fails fast with a transient error instead of waiting for the rebuild
+// (up to Init_Timeout_Sec), and only one rebuild is started.
+func TestFLBPluginFlushCtxExactlyOnceRebuildDoesNotBlockFlushes(t *testing.T) {
+	f := newExactlyOnceFixture(t, func(c *outputConfig) {
+		c.initTimeout = 10 * time.Second
+		c.flushTimeout = 500 * time.Millisecond
+	})
+	block := blockNewStreams(f.client)
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"})
+	tw := f.router.static
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		return readyResult(-1, invalidStreamTypeErr(t)), nil
+	})
+
+	first := make(chan int, 1)
+	go func() { first <- FLBPluginFlushCtx(ptr, data, n, cTag("app")) }()
+	require.Eventually(t, func() bool { return currentStream(tw) == nil }, time.Second, time.Millisecond, "the first flush starts rebuilding")
+
+	start := time.Now()
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Less(t, time.Since(start), f.cfg.flushTimeout, "the concurrent flush does not wait for the rebuild")
+	assert.Equal(t, int32(1), f.stream.appends.Load(), "the concurrent flush does not touch the closed stream")
+
+	close(block)
+	assert.Equal(t, output.FLB_OK, <-first)
+	assert.Equal(t, 2, f.client.newStreamCalls(), "the concurrent flush does not start a second rebuild")
+	assert.Equal(t, int32(1), f.client.streams[1].appends.Load())
+	assert.Equal(t, int64(1), tw.offset())
+}
+
+// A stream whose rebuild completes after the writer was closed is closed rather than installed.
+func TestTableWriterCloseDuringRebuild(t *testing.T) {
+	f := newExactlyOnceFixture(t, func(c *outputConfig) { c.initTimeout = 10 * time.Second })
+	block := blockNewStreams(f.client)
+	tw := f.router.static
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		return readyResult(-1, invalidStreamTypeErr(t)), nil
+	})
+
+	flushErr := make(chan error, 1)
+	go func() { flushErr <- tw.flush(context.Background(), [][]byte{{}}) }()
+	require.Eventually(t, func() bool { return currentStream(tw) == nil }, time.Second, time.Millisecond)
+
+	assert.False(t, tw.close(context.Background()))
+	assert.Equal(t, int32(1), f.stream.closes.Load(), "close does not touch the detached stream again")
+
+	close(block)
+	err := <-flushErr
+	require.Error(t, err)
+	assert.True(t, isTransientError(err), "%v", err)
+	require.Eventually(t, func() bool { return f.client.streams[1].closes.Load() == 1 }, time.Second, time.Millisecond,
+		"the late stream is closed instead of being installed")
+	assert.Nil(t, currentStream(tw))
 }
 
 // TestFLBPluginExitCtxDrainsPendingResponses verifies that FLBPluginExitCtx waits for every

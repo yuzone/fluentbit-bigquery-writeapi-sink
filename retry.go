@@ -38,7 +38,8 @@ func isTransientError(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
-		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, errAppendBlocked) {
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, errAppendBlocked) || errors.Is(err, errStreamRebuilding) {
 		return true
 	}
 	var netErr net.Error

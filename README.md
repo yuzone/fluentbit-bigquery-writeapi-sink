@@ -232,7 +232,15 @@ Which failures are visible at flush time depends on the mode:
   way (`FLB_RETRY`, not `Unknown_Table_Action`).
 - **Committed stream (`Exactly_Once true`)**: every append is confirmed
   synchronously and retried up to `Num_Synchronous_Retries` times for
-  transient errors before the chunk is reported as `FLB_RETRY`.
+  transient errors before the chunk is reported as `FLB_RETRY`. When the
+  backend rejects an append because the stream itself is no longer valid
+  (`INVALID_STREAM_TYPE`), the stream is finalized, closed and replaced by a
+  new committed stream (offset 0) and the chunk is appended to it within the
+  same flush. At most one rebuild happens per flush: if the new stream is
+  rejected the same way, the chunk is treated as a permanent failure
+  (`FLB_ERROR`). If the backend is unreachable while rebuilding, the flush is
+  reported as `FLB_RETRY` and the next flush of that table rebuilds the stream
+  before appending.
 
 A chunk larger than `Max_Chunk_Size` is sent as several `AppendRows` requests.
 When a transient failure occurs the plugin stops sending the remaining
