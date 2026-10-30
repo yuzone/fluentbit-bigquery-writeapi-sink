@@ -20,10 +20,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
-	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"github.com/fluent/fluent-bit-go/output"
-	"github.com/googleapis/gax-go/v2"
 )
 
 var (
@@ -38,113 +35,81 @@ type (
 	cInt  = C.int
 )
 
-// ManagedWriterClient wraps *managedwriter.Client so that tests can inject a mock.
-type ManagedWriterClient interface {
-	NewManagedStream(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error)
-	GetWriteStream(ctx context.Context, req *storagepb.GetWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error)
-	Close() error
-	BatchCommitWriteStreams(ctx context.Context, req *storagepb.BatchCommitWriteStreamsRequest, opts ...gax.CallOption) (*storagepb.BatchCommitWriteStreamsResponse, error)
-	CreateWriteStream(ctx context.Context, req *storagepb.CreateWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error)
+// flbBridge is the Fluent Bit C bridge used by the exported entry points. The real
+// implementation forwards to fluent-bit-go's output package; tests supply a fake.
+type flbBridge interface {
+	Register(def unsafe.Pointer, name, desc string) int
+	ConfigKey(plugin unsafe.Pointer, key string) string
+	SetContext(plugin unsafe.Pointer, ctx interface{})
+	GetContext(ctx unsafe.Pointer) interface{}
 }
 
-type realManagedWriterClient struct {
-	currClient *managedwriter.Client
+type outputBridge struct{}
+
+func (outputBridge) Register(def unsafe.Pointer, name, desc string) int {
+	return output.FLBPluginRegister(def, name, desc)
 }
 
-func (r *realManagedWriterClient) NewManagedStream(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error) {
-	return r.currClient.NewManagedStream(ctx, opts...)
+func (outputBridge) ConfigKey(plugin unsafe.Pointer, key string) string {
+	return output.FLBPluginConfigKey(plugin, key)
 }
 
-func (r *realManagedWriterClient) GetWriteStream(ctx context.Context, req *storagepb.GetWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error) {
-	return r.currClient.GetWriteStream(ctx, req, opts...)
+func (outputBridge) SetContext(plugin unsafe.Pointer, ctx interface{}) {
+	output.FLBPluginSetContext(plugin, ctx)
 }
 
-func (r *realManagedWriterClient) Close() error {
-	return r.currClient.Close()
+func (outputBridge) GetContext(ctx unsafe.Pointer) interface{} {
+	return output.FLBPluginGetContext(ctx)
 }
 
-func (r *realManagedWriterClient) BatchCommitWriteStreams(ctx context.Context, req *storagepb.BatchCommitWriteStreamsRequest, opts ...gax.CallOption) (*storagepb.BatchCommitWriteStreamsResponse, error) {
-	return r.currClient.BatchCommitWriteStreams(ctx, req, opts...)
+// pluginDeps groups every external dependency of the exported entry points. The exported
+// functions have no receiver, so this single package-level value is the injection point;
+// everything below it (outputConfig, tableRouter, tableWriter) receives its dependencies
+// through constructors.
+type pluginDeps struct {
+	flb       flbBridge
+	newClient newClientFunc
+	clock     clock
 }
 
-func (r *realManagedWriterClient) CreateWriteStream(ctx context.Context, req *storagepb.CreateWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error) {
-	return r.currClient.CreateWriteStream(ctx, req, opts...)
+var deps = pluginDeps{
+	flb:       outputBridge{},
+	newClient: newRealManagedWriterClient,
+	clock:     realClock(),
 }
 
-// getClient wraps managedwriter.NewClient; tests override it to return a mock ManagedWriterClient.
-var getClient = func(ctx context.Context, projectID string) (ManagedWriterClient, error) {
-	client, err := managedwriter.NewClient(ctx, projectID)
-	if err != nil {
-		return nil, err
-	}
-	return &realManagedWriterClient{currClient: client}, nil
-}
-
-// MWManagedStream is the subset of *managedwriter.ManagedStream used by the plugin.
-type MWManagedStream interface {
-	AppendRows(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error)
-	Close() error
-	Finalize(ctx context.Context, opts ...gax.CallOption) (int64, error)
-	FlushRows(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error)
-	StreamName() string
-}
-
-// getWriter wraps ManagedWriterClient.NewManagedStream; tests override it to return a mock stream.
-var getWriter = func(client ManagedWriterClient, ctx context.Context, projectID string, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
-	return client.NewManagedStream(ctx, opts...)
-}
-
-// newDecoder is a wrapper around output.NewDecoder to allow test injection.
-var newDecoder = func(data unsafe.Pointer, length int) *output.FLBDecoder {
-	return output.NewDecoder(data, length)
-}
-
-// getFLBPluginContext wraps output.FLBPluginGetContext so that tests can override it.
-var getFLBPluginContext = func(ctx unsafe.Pointer) int {
-	if ctx != nil {
-		id, ok := output.FLBPluginGetContext(ctx).(int)
-		if !ok {
-			log.Printf("FLBPluginGetContext returned unexpected type for context pointer %p", ctx)
-			return 0
-		}
-		return id
-	}
-	return 0
-}
-
-// getInstanceCount is a test-only helper that returns the number of registered output instances.
-func getInstanceCount() int {
-	return len(configMap)
-}
-
-// getOffset is a test-only helper that returns the offset counter of the first stream of the
-// instance's static table writer.
-func getOffset(id int) int64 {
-	config, ok := configMap[id]
-	if !ok || config == nil || config.router == nil || config.router.static == nil {
+// instanceID extracts the output instance id stored with SetContext.
+func instanceID(ctx unsafe.Pointer) int {
+	if ctx == nil {
 		return 0
 	}
-	return config.router.static.offset()
+	id, ok := deps.flb.GetContext(ctx).(int)
+	if !ok {
+		log.Printf("FLBPluginGetContext returned unexpected type for context pointer %p", ctx)
+		return 0
+	}
+	return id
 }
 
 //export FLBPluginRegister
 func FLBPluginRegister(def unsafe.Pointer) int {
-	return output.FLBPluginRegister(def, "writeapi", "Sends data to BigQuery through WriteAPI")
+	return deps.flb.Register(def, "writeapi", "Sends data to BigQuery through WriteAPI")
 }
 
 //export FLBPluginInit
 func FLBPluginInit(plugin unsafe.Pointer) int {
-	cfg, err := parseOutputConfig(plugin)
+	cfg, err := parseOutputConfig(plugin, deps.flb)
 	if err != nil {
 		log.Print(err)
 		return output.FLB_ERROR
 	}
+	cfg.clock = deps.clock
 
 	// Create an instance-scoped context that outlives individual flush calls. Using it for client
 	// creation, stream creation (buildStream) and AppendRows ensures the managed writer's internal
 	// retry/reconnect logic is not aborted when a per-flush context is canceled at flush end.
 	cfg.instanceCtx, cfg.instanceCancel = context.WithCancel(context.Background())
-	cfg.client, err = getClient(cfg.instanceCtx, cfg.projectID)
+	cfg.client, err = deps.newClient(cfg.instanceCtx, cfg.projectID)
 	if err != nil {
 		cfg.instanceCancel()
 		log.Printf("Creating a new managed BigQuery Storage write client scoped to: %s failed in FLBPluginInit: %s", cfg.projectID, err)
@@ -169,7 +134,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	configMap[id] = cfg
 
 	// Creating FLB context for each output, enables multiinstancing
-	output.FLBPluginSetContext(plugin, id)
+	deps.flb.SetContext(plugin, id)
 
 	return output.FLB_OK
 }
@@ -269,7 +234,7 @@ func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, max
 
 //export FLBPluginFlushCtx
 func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int {
-	id := getFLBPluginContext(ctx)
+	id := instanceID(ctx)
 	config, ok := configMap[id]
 	if !ok {
 		log.Printf("Finding configuration for output instance with id: %d failed in FLBPluginFlushCtx", id)
@@ -302,7 +267,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	var outcome flushOutcome
 
 	// Decode and serialize all records; mid-size chunks are sent inside the helper.
-	binaryData = decodeAndSerializeRecords(flushCtx, tw, id, config.maxChunkSize, newDecoder(data, int(length)), binaryData, &outcome)
+	binaryData = decodeAndSerializeRecords(flushCtx, tw, id, config.maxChunkSize, output.NewDecoder(data, int(length)), binaryData, &outcome)
 
 	// Send the final (possibly partial) chunk unless a transient failure already aborted the chunk.
 	if !outcome.abort() {
@@ -320,7 +285,7 @@ func FLBPluginExit() int {
 
 //export FLBPluginExitCtx
 func FLBPluginExitCtx(ctx unsafe.Pointer) int {
-	id := getFLBPluginContext(ctx)
+	id := instanceID(ctx)
 
 	config, ok := configMap[id]
 	if !ok {

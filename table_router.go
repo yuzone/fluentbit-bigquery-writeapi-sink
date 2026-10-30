@@ -44,7 +44,6 @@ type tableRouter struct {
 
 	mu      sync.Mutex
 	entries map[string]*writerEntry
-	now     func() time.Time
 }
 
 func newTableRouter(cfg *outputConfig, id int) *tableRouter {
@@ -52,7 +51,6 @@ func newTableRouter(cfg *outputConfig, id int) *tableRouter {
 		cfg:     cfg,
 		id:      id,
 		entries: make(map[string]*writerEntry),
-		now:     time.Now,
 	}
 }
 
@@ -121,7 +119,7 @@ func (r *tableRouter) writerFor(dataset, table string) (*tableWriter, error) {
 	if ok {
 		select {
 		case <-e.done:
-			if e.err != nil && r.now().Sub(e.failedAt) >= initFailureTTL {
+			if e.err != nil && r.cfg.clock.now().Sub(e.failedAt) >= initFailureTTL {
 				ok = false
 			}
 		default:
@@ -137,7 +135,7 @@ func (r *tableRouter) writerFor(dataset, table string) (*tableWriter, error) {
 		r.mu.Lock()
 		e.tw, e.err = tw, err
 		if err != nil {
-			e.failedAt = r.now()
+			e.failedAt = r.cfg.clock.now()
 		}
 		r.mu.Unlock()
 		close(e.done)

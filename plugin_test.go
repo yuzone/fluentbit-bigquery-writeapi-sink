@@ -22,12 +22,17 @@ import (
 	"unsafe"
 
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"cloud.google.com/go/bigquery/storage/managedwriter/adapt"
 	"github.com/fluent/fluent-bit-go/output"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/ugorji/go/codec"
+	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 // encodeRecords msgpack-encodes Fluent Bit log records ([timestamp, map] pairs) exactly as
@@ -95,14 +100,17 @@ func TestFLBPluginFlushCtxReturnCodes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.retryOnFailure = tt.retryOnFailure })
 			require.NoError(t, f.router.init())
-			f.appendRows = func(ctx context.Context, data [][]byte) (*managedwriter.AppendResult, error) {
-				return nil, tt.appendErr
-			}
+			f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+				if tt.appendErr != nil {
+					return nil, tt.appendErr
+				}
+				return readyResult(-1, nil), nil
+			})
 			ptr := registerTestConfig(t, f.cfg)
 			data, n := encodeRecords(t, map[string]interface{}{"Text": "hello"})
 
 			assert.Equal(t, tt.want, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
-			assert.Equal(t, int32(1), f.appendCalls.Load())
+			assert.Equal(t, int32(1), f.appendCalls())
 		})
 	}
 }
@@ -115,9 +123,9 @@ func TestFLBPluginFlushCtxTransientFailureAbortsChunk(t *testing.T) {
 		c.maxChunkSize = 1 // every record becomes its own AppendRows call
 	})
 	require.NoError(t, f.router.init())
-	f.appendRows = func(ctx context.Context, data [][]byte) (*managedwriter.AppendResult, error) {
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
 		return nil, status.Error(codes.Unavailable, "x")
-	}
+	})
 	ptr := registerTestConfig(t, f.cfg)
 	data, n := encodeRecords(t,
 		map[string]interface{}{"Text": "a"},
@@ -126,7 +134,7 @@ func TestFLBPluginFlushCtxTransientFailureAbortsChunk(t *testing.T) {
 	)
 
 	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
-	assert.Equal(t, int32(1), f.appendCalls.Load(), "no further sub-chunks after a transient failure")
+	assert.Equal(t, int32(1), f.appendCalls(), "no further sub-chunks after a transient failure")
 }
 
 // A permanent failure does not abort the flush: the remaining sub-chunks are still sent and
@@ -137,12 +145,12 @@ func TestFLBPluginFlushCtxPermanentFailureContinues(t *testing.T) {
 		c.maxChunkSize = 1
 	})
 	require.NoError(t, f.router.init())
-	f.appendRows = func(ctx context.Context, data [][]byte) (*managedwriter.AppendResult, error) {
-		if f.appendCalls.Load() == 1 {
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		if f.appendCalls() == 1 {
 			return nil, status.Error(codes.InvalidArgument, "x")
 		}
-		return nil, nil
-	}
+		return readyResult(-1, nil), nil
+	})
 	ptr := registerTestConfig(t, f.cfg)
 	data, n := encodeRecords(t,
 		map[string]interface{}{"Text": "a"},
@@ -151,7 +159,7 @@ func TestFLBPluginFlushCtxPermanentFailureContinues(t *testing.T) {
 	)
 
 	assert.Equal(t, output.FLB_ERROR, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
-	assert.Equal(t, int32(3), f.appendCalls.Load())
+	assert.Equal(t, int32(3), f.appendCalls())
 }
 
 // In exactly-once mode the synchronous GetResult error (after the configured retries) decides
@@ -174,11 +182,9 @@ func TestFLBPluginFlushCtxExactlyOnceReturnCodes(t *testing.T) {
 				c.numRetries = 0
 			})
 			require.NoError(t, f.router.init())
-			origGetResult := pluginGetResult
-			pluginGetResult = func(_ *managedwriter.AppendResult, _ context.Context) (int64, error) {
-				return 0, tt.resultErr
-			}
-			t.Cleanup(func() { pluginGetResult = origGetResult })
+			f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+				return readyResult(0, tt.resultErr), nil
+			})
 			ptr := registerTestConfig(t, f.cfg)
 			data, n := encodeRecords(t, map[string]interface{}{"Text": "hello"})
 
@@ -186,4 +192,270 @@ func TestFLBPluginFlushCtxExactlyOnceReturnCodes(t *testing.T) {
 			assert.Equal(t, int64(0), f.router.static.offset(), "offset is not advanced on failure")
 		})
 	}
+}
+
+// defaultInitKeys is the minimal configuration accepted by FLBPluginInit.
+func defaultInitKeys(overrides map[string]string) map[string]string {
+	keys := map[string]string{
+		"ProjectID":          "DummyProjectId",
+		"DatasetID":          "DummyDatasetId",
+		"TableID":            "DummyTableId",
+		"Max_Queue_Requests": "0",
+		"Max_Queue_Bytes":    "0",
+		"Exactly_Once":       "False",
+	}
+	for k, v := range overrides {
+		keys[k] = v
+	}
+	return keys
+}
+
+// fiveRecords returns five records whose Text/Time fields the fake stream can verify.
+func fiveRecords(t *testing.T) (unsafe.Pointer, cInt) {
+	t.Helper()
+	records := make([]map[string]interface{}, 5)
+	for i := range records {
+		records[i] = map[string]interface{}{"Text": "FOO", "Time": "000"}
+	}
+	return encodeRecords(t, records...)
+}
+
+// decodeRows unmarshals the serialized rows of one AppendRows call against the schema.
+func decodeRows(t *testing.T, data [][]byte) []*dynamicpb.Message {
+	t.Helper()
+	descriptor, err := adapt.StorageSchemaToProto2Descriptor(defaultTestSchema, "root")
+	require.NoError(t, err)
+	md := descriptor.(protoreflect.MessageDescriptor)
+	msgs := make([]*dynamicpb.Message, 0, len(data))
+	for _, row := range data {
+		m := dynamicpb.NewMessage(md)
+		require.NoError(t, proto.Unmarshal(row, m))
+		msgs = append(msgs, m)
+	}
+	return msgs
+}
+
+func TestFLBPluginRegister(t *testing.T) {
+	d := installTestDeps(t, nil)
+	assert.Equal(t, 0, FLBPluginRegister(nil))
+	assert.Equal(t, []string{"writeapi"}, d.bridge.registered)
+}
+
+func TestFLBPluginInit(t *testing.T) {
+	for _, exactlyOnce := range []string{"False", "True"} {
+		t.Run("Exactly_Once="+exactlyOnce, func(t *testing.T) {
+			d := installTestDeps(t, defaultInitKeys(map[string]string{"Exactly_Once": exactlyOnce, "Max_Chunk_Size": "0"}))
+
+			plugin, id := initPlugin(t)
+
+			for _, key := range []string{"ProjectID", "DatasetID", "TableID", "Max_Chunk_Size", "Max_Queue_Requests", "Max_Queue_Bytes", "Exactly_Once"} {
+				assert.Equal(t, 1, d.bridge.keysRead[key], key)
+			}
+			assert.Equal(t, int32(1), d.newClients.Load())
+			assert.Equal(t, 1, d.client.getWriteStreamCalls("projects/DummyProjectId/datasets/DummyDatasetId/tables/DummyTableId/streams/_default"))
+			assert.Equal(t, 1, d.client.newStreamCalls())
+			assert.Len(t, d.client.newStreamOpts[0], 8, "every writer option must be passed to NewManagedStream")
+			assert.Equal(t, 1, d.bridge.setContexts)
+			assert.Equal(t, id, instanceID(plugin))
+			assert.Equal(t, exactlyOnce == "True", configMap[id].exactlyOnce)
+		})
+	}
+}
+
+func TestFLBPluginInitFailures(t *testing.T) {
+	t.Run("invalid configuration", func(t *testing.T) {
+		installTestDeps(t, defaultInitKeys(map[string]string{"Max_Chunk_Size": "abc"}))
+		assert.Equal(t, output.FLB_ERROR, FLBPluginInit(unsafe.Pointer(new(int))))
+	})
+	t.Run("client creation fails", func(t *testing.T) {
+		d := installTestDeps(t, defaultInitKeys(nil))
+		d.newClient = func(context.Context, string, ...option.ClientOption) (ManagedWriterClient, error) {
+			return nil, errors.New("no credentials")
+		}
+		assert.Equal(t, output.FLB_ERROR, FLBPluginInit(unsafe.Pointer(new(int))))
+	})
+	t.Run("missing table", func(t *testing.T) {
+		d := installTestDeps(t, defaultInitKeys(nil))
+		d.client.failTables["projects/DummyProjectId/datasets/DummyDatasetId/tables/DummyTableId/streams/_default"] = status.Error(codes.NotFound, "x")
+		before := getInstanceCount()
+		assert.Equal(t, output.FLB_ERROR, FLBPluginInit(unsafe.Pointer(new(int))))
+		assert.Equal(t, before, getInstanceCount())
+	})
+}
+
+// TestFLBPluginFlushCtx covers the default (at-least-once) path end to end: records are decoded
+// from msgpack, serialized against the table schema and appended; the response of the first
+// flush is drained on the second one.
+func TestFLBPluginFlushCtx(t *testing.T) {
+	d := installTestDeps(t, defaultInitKeys(nil))
+	plugin, _ := initPlugin(t)
+	stream := d.client.streams[0]
+	stream.mu.Lock()
+	stream.onAppend = func(_ context.Context, data [][]byte, _ []managedwriter.AppendOption) (appendResult, error) {
+		msgs := decodeRows(t, data)
+		require.Len(t, msgs, 5)
+		md := msgs[0].Descriptor()
+		for _, m := range msgs {
+			assert.Equal(t, "FOO", m.Get(md.Fields().ByName("Text")).String())
+			assert.Equal(t, "000", m.Get(md.Fields().ByName("Time")).String())
+		}
+		r := readyResult(-1, nil)
+		stream.results = append(stream.results, r)
+		return r, nil
+	}
+	stream.mu.Unlock()
+
+	getContextsBefore := d.bridge.getContexts
+	data, n := fiveRecords(t)
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.Equal(t, int32(0), stream.getResultCalls(), "responses are checked on the next flush")
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+
+	assert.Equal(t, int32(2), stream.appends.Load())
+	assert.Equal(t, int32(1), stream.getResultCalls())
+	assert.Equal(t, 2, d.bridge.getContexts-getContextsBefore, "each flush resolves its instance via the FLB context")
+}
+
+func TestFLBPluginFlushCtxUnknownInstance(t *testing.T) {
+	installTestDeps(t, nil)
+	assert.Equal(t, output.FLB_ERROR, FLBPluginFlushCtx(nil, nil, 0, nil))
+	assert.Equal(t, output.FLB_ERROR, FLBPluginExitCtx(nil))
+}
+
+// TestFLBPluginFlushCtxDynamicScaling verifies that a new stream is added whenever the least
+// loaded stream has more pending responses than the request-count threshold.
+func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
+	d := installTestDeps(t, defaultInitKeys(nil))
+	plugin, id := initPlugin(t)
+	configMap[id].requestCountThreshold = 0 // scale as soon as one response is pending
+	for _, s := range d.client.streams {
+		s.pending = true
+	}
+	d.client.mu.Lock()
+	d.client.stream = &fakeStream{pending: true}
+	d.client.mu.Unlock()
+
+	data, n := fiveRecords(t)
+	for i := 0; i < 3; i++ {
+		assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	}
+	// Init creates the first stream; the 2nd and 3rd flush each observe one pending response
+	// on the least loaded stream and add another one.
+	assert.Equal(t, 3, d.client.newStreamCalls())
+	assert.Len(t, configMap[id].router.static.streams, 3)
+}
+
+func TestFLBPluginFlushCtxDynamicScalingCap(t *testing.T) {
+	d := installTestDeps(t, defaultInitKeys(nil))
+	plugin, id := initPlugin(t)
+	configMap[id].requestCountThreshold = 0
+	d.client.mu.Lock()
+	d.client.stream = &fakeStream{pending: true}
+	d.client.mu.Unlock()
+	d.client.streams[0].pending = true
+
+	data, n := fiveRecords(t)
+	for i := 0; i < maxNumStreamsPerInstance+3; i++ {
+		FLBPluginFlushCtx(plugin, data, n, cTag("app"))
+	}
+	assert.Len(t, configMap[id].router.static.streams, maxNumStreamsPerInstance)
+}
+
+// TestFLBPluginFlushCtxExactlyOnce verifies the committed-stream path: responses are checked
+// synchronously, the offset advances by the number of rows, and WithOffset is passed.
+func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
+	d := installTestDeps(t, defaultInitKeys(map[string]string{"Exactly_Once": "True"}))
+	plugin, id := initPlugin(t)
+	stream := d.client.streams[0]
+	var optCounts []int
+	stream.mu.Lock()
+	stream.onAppend = func(_ context.Context, data [][]byte, opts []managedwriter.AppendOption) (appendResult, error) {
+		optCounts = append(optCounts, len(opts))
+		require.Len(t, decodeRows(t, data), 5)
+		r := readyResult(int64(len(data)), nil)
+		stream.results = append(stream.results, r)
+		return r, nil
+	}
+	stream.mu.Unlock()
+
+	data, n := fiveRecords(t)
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.Equal(t, int64(5), getOffset(id))
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.Equal(t, int64(10), getOffset(id))
+
+	assert.Equal(t, int32(2), stream.appends.Load())
+	assert.Equal(t, int32(2), stream.getResultCalls(), "exactly-once checks every response synchronously")
+	assert.Equal(t, []int{1, 1}, optCounts, "WithOffset is passed on every append")
+}
+
+// TestFLBPluginFlushCtxErrorHandling verifies that the offset is not advanced when the server
+// rejects an append, and that the failure is retried Num_Retries times with backoff.
+func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
+	d := installTestDeps(t, defaultInitKeys(map[string]string{"Exactly_Once": "True", "Num_Synchronous_Retries": "2"}))
+	plugin, id := initPlugin(t)
+	stream := d.client.streams[0]
+	var call int
+	stream.mu.Lock()
+	stream.onAppend = func(_ context.Context, data [][]byte, _ []managedwriter.AppendOption) (appendResult, error) {
+		call++
+		if call <= 3 {
+			return readyResult(-1, status.Error(codes.Internal, "mocked server-side error")), nil
+		}
+		return readyResult(int64(len(data)), nil), nil
+	}
+	stream.mu.Unlock()
+
+	data, n := fiveRecords(t)
+	// Attempts 1-3 fail (initial + 2 retries) -> FLB_RETRY, offset unchanged.
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.Equal(t, int64(0), getOffset(id))
+	assert.Len(t, d.clock.sleeps, 2, "backoff between retries uses the injected clock")
+	// Attempt 4 succeeds.
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.Equal(t, int64(5), getOffset(id))
+	assert.Equal(t, int32(4), stream.appends.Load())
+}
+
+// TestFLBPluginExitCtxDrainsPendingResponses verifies that FLBPluginExitCtx waits for every
+// pending response before closing the stream and the client.
+func TestFLBPluginExitCtxDrainsPendingResponses(t *testing.T) {
+	d := installTestDeps(t, defaultInitKeys(nil))
+	plugin, _ := initPlugin(t)
+	stream := d.client.streams[0]
+	stream.pending = true
+
+	data, n := fiveRecords(t)
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.Equal(t, int32(1), stream.appends.Load())
+	assert.Equal(t, int32(0), stream.getResultCalls(), "pending response is not drained by the flush")
+
+	assert.Equal(t, output.FLB_OK, FLBPluginExitCtx(plugin))
+	assert.Equal(t, int32(1), stream.getResultCalls(), "drained during exit")
+	assert.Equal(t, int32(1), stream.closes.Load())
+	assert.Equal(t, int32(1), d.client.closes.Load())
+}
+
+// TestFLBPluginFlushCtxAppendUsesInstanceContext is a regression test for the bug where the
+// per-flush context was passed to AppendRows on the default (at-least-once) path. Because appends
+// are acknowledged asynchronously on a later flush, canceling the flush context at flush end aborted
+// the managed writer's internal retry/reconnect. AppendRows must receive the instance-scoped
+// context, which stays alive until FLBPluginExitCtx.
+func TestFLBPluginFlushCtxAppendUsesInstanceContext(t *testing.T) {
+	d := installTestDeps(t, defaultInitKeys(nil))
+	plugin, id := initPlugin(t)
+	stream := d.client.streams[0]
+	stream.pending = true
+	instanceCtx := configMap[id].instanceCtx
+
+	data, n := fiveRecords(t)
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+
+	require.Len(t, stream.ctxs, 1, "AppendRows should have been called")
+	captured := stream.ctxs[0]
+	assert.NoError(t, captured.Err(), "AppendRows context must not be canceled after the flush returns")
+	assert.Equal(t, instanceCtx, captured, "AppendRows must use the instance-scoped context")
+
+	assert.Equal(t, output.FLB_OK, FLBPluginExitCtx(plugin))
+	assert.Error(t, captured.Err(), "instance-scoped context must be canceled after exit")
 }

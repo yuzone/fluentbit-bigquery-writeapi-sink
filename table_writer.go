@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
@@ -36,7 +35,7 @@ import (
 // streamConfig holds the state of one managed stream. A tableWriter owns one or more.
 type streamConfig struct {
 	managedstream MWManagedStream
-	appendResults []*managedwriter.AppendResult
+	appendResults []appendResult
 	offsetCounter int64
 }
 
@@ -86,7 +85,7 @@ func newTableWriter(ctx context.Context, client ManagedWriterClient, project, da
 		streams:           []*streamConfig{{}},
 	}
 
-	if err := buildStream(ctx, tw, 0); err != nil {
+	if err := tw.buildStream(ctx, 0); err != nil {
 		return nil, fmt.Errorf("Creating a new managed stream with destination table: %s failed: %w", tableRef, err)
 	}
 	return tw, nil
@@ -268,7 +267,7 @@ func (tw *tableWriter) serializeRecord(record map[interface{}]interface{}) ([]by
 	return rawMapToBinary(tw.messageDescriptor, record, tw.fieldCache)
 }
 
-var isReady = func(result *managedwriter.AppendResult) bool {
+func isReady(result appendResult) bool {
 	select {
 	case <-result.Ready():
 		return true
@@ -277,7 +276,8 @@ var isReady = func(result *managedwriter.AppendResult) bool {
 	}
 }
 
-var pluginGetResult = func(result *managedwriter.AppendResult, ctx context.Context) (int64, error) {
+// getResult waits for the server response of one append and logs any per-row errors.
+func getResult(result appendResult, ctx context.Context) (int64, error) {
 	offset, err := result.GetResult(ctx)
 	if err != nil {
 		// Try to get detailed row errors from FullResponse
@@ -306,7 +306,7 @@ func (tw *tableWriter) checkResponses(ctx context.Context, stream *streamConfig,
 	for readIdx := 0; readIdx < len(currQueue); readIdx++ {
 		result := currQueue[readIdx]
 		if waitForResponse || isReady(result) {
-			_, err := pluginGetResult(result, ctx)
+			_, err := getResult(result, ctx)
 			if err != nil {
 				log.Printf("Encountered error:%s while verifying the server response to a data append for output instance with id: %d", err, tw.id)
 			}
@@ -332,9 +332,9 @@ func (tw *tableWriter) drainResponses(ctx context.Context, waitForResponse bool)
 	}
 }
 
-// buildStream is a var so tests can replace it without gomonkey.
-var buildStream = func(ctx context.Context, tw *tableWriter, streamIndex int) error {
-	currManagedStream, err := getWriter(tw.client, ctx, tw.cfg.projectID,
+// buildStream creates the managed stream at streamIndex.
+func (tw *tableWriter) buildStream(ctx context.Context, streamIndex int) error {
+	currManagedStream, err := tw.client.NewManagedStream(ctx,
 		managedwriter.WithType(tw.cfg.streamType),
 		managedwriter.WithDestinationTable(tw.tableRef),
 		// Use the descriptor proto when creating the new managed stream
@@ -371,12 +371,12 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 
 	currStream := tw.streams[streamIndex]
 
-	appendResult, err := currStream.managedstream.AppendRows(ctx, data, managedwriter.WithOffset(currStream.offsetCounter))
+	result, err := currStream.managedstream.AppendRows(ctx, data, managedwriter.WithOffset(currStream.offsetCounter))
 	if err != nil {
 		return err
 	}
 	// Synchronously check the response immediately after appending data with exactly once semantics
-	_, err = pluginGetResult(appendResult, ctx)
+	_, err = getResult(result, ctx)
 	if err != nil {
 		return err
 	}
@@ -407,7 +407,7 @@ func (tw *tableWriter) sendRequestRetries(ctx context.Context, data [][]byte, st
 			currStream.managedstream.Finalize(ctx)
 			currStream.managedstream.Close()
 			// Rebuild stream
-			buildErr := buildStream(tw.ctx, tw, streamIndex)
+			buildErr := tw.buildStream(tw.ctx, streamIndex)
 			tw.streamMu.Unlock()
 			if buildErr != nil {
 				return buildErr
@@ -420,7 +420,7 @@ func (tw *tableWriter) sendRequestRetries(ctx context.Context, data [][]byte, st
 			}
 			// Retry sending data after incrementing attempt count and waiting for designated amount of time
 			attempt++
-			time.Sleep(backoffPeriod)
+			tw.cfg.clock.sleep(backoffPeriod)
 		}
 
 	}
@@ -441,12 +441,12 @@ func (tw *tableWriter) sendRequestDefault(data [][]byte, streamIndex int) error 
 	// is saturated.
 	currStream := tw.getStream(streamIndex)
 
-	appendResult, err := currStream.managedstream.AppendRows(tw.ctx, data)
+	result, err := currStream.managedstream.AppendRows(tw.ctx, data)
 	if err != nil {
 		return err
 	}
 
-	tw.appendResult(currStream, appendResult)
+	tw.queueResult(currStream, result)
 	return nil
 }
 
@@ -484,8 +484,8 @@ func (tw *tableWriter) getStream(index int) *streamConfig {
 	return tw.streams[index]
 }
 
-// appendResult appends an AppendResult to the stream's result queue under streamMu.
-func (tw *tableWriter) appendResult(stream *streamConfig, result *managedwriter.AppendResult) {
+// queueResult appends an append result to the stream's result queue under streamMu.
+func (tw *tableWriter) queueResult(stream *streamConfig, result appendResult) {
 	tw.streamMu.Lock()
 	defer tw.streamMu.Unlock()
 	stream.appendResults = append(stream.appendResults, result)
@@ -508,8 +508,8 @@ func (tw *tableWriter) offset() int64 {
 	return tw.streams[0].offsetCounter
 }
 
-// Method to determine threshold
-var setThreshold = func(maxQueueSize int) int {
+// requestCountThreshold returns the per-stream queue length above which a new stream is added.
+func requestCountThreshold(maxQueueSize int) int {
 	requestCountThreshold := int(math.Floor(queueRequestScalingPercent * float64(maxQueueSize)))
 	if requestCountThreshold < minQueueRequests {
 		requestCountThreshold = minQueueRequests
@@ -533,7 +533,7 @@ func (tw *tableWriter) maybeScale() {
 	if mostEfficientQueueLength > tw.cfg.requestCountThreshold {
 		tw.streams = append(tw.streams, &streamConfig{})
 		newStreamIndex := len(tw.streams) - 1
-		err := buildStream(tw.ctx, tw, newStreamIndex)
+		err := tw.buildStream(tw.ctx, newStreamIndex)
 		if err != nil {
 			log.Printf("Creating an additional managed stream with destination table: %s failed in FLBPluginInit: %s", tw.tableRef, err)
 			// If failure, failed stream is removed from slice

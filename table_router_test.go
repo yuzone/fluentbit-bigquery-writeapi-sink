@@ -17,7 +17,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -25,7 +24,6 @@ import (
 	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/bigquery/storage/managedwriter"
 	"github.com/fluent/fluent-bit-go/output"
-	"github.com/googleapis/gax-go/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -88,65 +86,25 @@ func TestValidIDs(t *testing.T) {
 	assert.False(t, validDatasetID(""))
 }
 
-// routerFixture builds an outputConfig + tableRouter backed by a mock client whose
-// GetWriteStream calls are counted per table and can be failed selectively.
+// routerFixture builds an outputConfig + tableRouter backed by a fakeClient. All tables share
+// one fakeStream so appends can be counted and controlled in one place.
 type routerFixture struct {
-	cfg            *outputConfig
-	router         *tableRouter
-	getWriteStream map[string]*atomic.Int32 // table ref -> call count
-	failTables     map[string]error         // table ref -> error returned by GetWriteStream
-	appendRows     func(ctx context.Context, data [][]byte) (*managedwriter.AppendResult, error)
-	appendCalls    atomic.Int32
-	closedStreams  atomic.Int32
-	mu             sync.Mutex
-	restore        func()
+	cfg    *outputConfig
+	router *tableRouter
+	deps   *testDeps
+	client *fakeClient
+	stream *fakeStream
+	clock  *fakeClock
 }
 
 func newRouterFixture(t *testing.T, dataset, table string, mutate func(*outputConfig)) *routerFixture {
 	t.Helper()
-	f := &routerFixture{
-		getWriteStream: map[string]*atomic.Int32{},
-		failTables:     map[string]error{},
-	}
-	schema := &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
+	d := installTestDeps(t, nil)
+	f := &routerFixture{deps: d, client: d.client, clock: d.clock, stream: &fakeStream{}}
+	f.client.stream = f.stream
+	f.client.schema = &storagepb.TableSchema{Fields: []*storagepb.TableFieldSchema{
 		{Name: "Text", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
 	}}
-	client := &MockManagedWriterClient{
-		GetWriteStreamFunc: func(ctx context.Context, req *storagepb.GetWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error) {
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			c, ok := f.getWriteStream[req.GetName()]
-			if !ok {
-				c = &atomic.Int32{}
-				f.getWriteStream[req.GetName()] = c
-			}
-			c.Add(1)
-			if err, ok := f.failTables[req.GetName()]; ok {
-				return nil, err
-			}
-			return &storagepb.WriteStream{Name: req.GetName(), TableSchema: schema}, nil
-		},
-		CloseFunc: func() error { return nil },
-	}
-	mockStream := &MockManagedStream{
-		AppendRowsFunc: func(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error) {
-			f.appendCalls.Add(1)
-			if f.appendRows != nil {
-				return f.appendRows(ctx, data)
-			}
-			return nil, nil
-		},
-		CloseFunc:      func() error { f.closedStreams.Add(1); return nil },
-		FinalizeFunc:   func(ctx context.Context, opts ...gax.CallOption) (int64, error) { return 0, nil },
-		FlushRowsFunc:  func(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error) { return 0, nil },
-		StreamNameFunc: func() string { return "" },
-	}
-	origGetWriter := getWriter
-	getWriter = func(client ManagedWriterClient, ctx context.Context, projectID string, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
-		return mockStream, nil
-	}
-	f.restore = func() { getWriter = origGetWriter }
-	t.Cleanup(f.restore)
 
 	datasetTpl, err := parseTagTemplate(dataset)
 	require.NoError(t, err)
@@ -164,10 +122,11 @@ func newRouterFixture(t *testing.T, dataset, table string, mutate func(*outputCo
 		maxChunkSize:          chunkSizeLimit,
 		maxQueueBytes:         queueByteDefault,
 		maxQueueRequests:      queueRequestDefault,
-		requestCountThreshold: setThreshold(queueRequestDefault),
+		requestCountThreshold: requestCountThreshold(queueRequestDefault),
 		dateTimeStringType:    true,
 		flushTimeout:          time.Second,
-		client:                client,
+		client:                f.client,
+		clock:                 d.clock.clock(),
 		instanceCtx:           ctx,
 		instanceCancel:        cancel,
 	}
@@ -179,17 +138,36 @@ func newRouterFixture(t *testing.T, dataset, table string, mutate func(*outputCo
 	return f
 }
 
+// failTable makes GetWriteStream fail for the given table.
+func (f *routerFixture) failTable(dataset, table string, err error) {
+	f.client.mu.Lock()
+	defer f.client.mu.Unlock()
+	f.client.failTables[streamName(dataset, table)] = err
+}
+
+func (f *routerFixture) unfailTable(dataset, table string) {
+	f.client.mu.Lock()
+	defer f.client.mu.Unlock()
+	delete(f.client.failTables, streamName(dataset, table))
+}
+
+// onAppend installs the AppendRows handler of the shared stream.
+func (f *routerFixture) onAppend(fn func(ctx context.Context, data [][]byte) (appendResult, error)) {
+	f.stream.mu.Lock()
+	defer f.stream.mu.Unlock()
+	f.stream.onAppend = func(ctx context.Context, data [][]byte, _ []managedwriter.AppendOption) (appendResult, error) {
+		return fn(ctx, data)
+	}
+}
+
+func (f *routerFixture) appendCalls() int32 { return f.stream.appends.Load() }
+
 func streamName(dataset, table string) string {
 	return "projects/p/datasets/" + dataset + "/tables/" + table + "/streams/_default"
 }
 
 func (f *routerFixture) calls(dataset, table string) int32 {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if c, ok := f.getWriteStream[streamName(dataset, table)]; ok {
-		return c.Load()
-	}
-	return 0
+	return int32(f.client.getWriteStreamCalls(streamName(dataset, table)))
 }
 
 func TestTableRouterStaticTableIgnoresTag(t *testing.T) {
@@ -209,7 +187,7 @@ func TestTableRouterStaticTableIgnoresTag(t *testing.T) {
 
 func TestTableRouterStaticInitFailure(t *testing.T) {
 	f := newRouterFixture(t, "ds", "missing", nil)
-	f.failTables[streamName("ds", "missing")] = errors.New("rpc error: code = NotFound")
+	f.failTable("ds", "missing", errors.New("rpc error: code = NotFound"))
 	assert.Error(t, f.router.init())
 }
 
@@ -292,9 +270,7 @@ func TestTableRouterLazyInitOnceUnderConcurrency(t *testing.T) {
 func TestTableRouterNegativeCache(t *testing.T) {
 	f := newRouterFixture(t, "ds", "$TAG[1]", nil)
 	require.NoError(t, f.router.init())
-	now := time.Unix(1_700_000_000, 0)
-	f.router.now = func() time.Time { return now }
-	f.failTables[streamName("ds", "typo")] = errors.New("rpc error: code = NotFound")
+	f.failTable("ds", "typo", errors.New("rpc error: code = NotFound"))
 
 	for i := 0; i < 5; i++ {
 		_, err := f.router.resolve("app.typo")
@@ -303,8 +279,8 @@ func TestTableRouterNegativeCache(t *testing.T) {
 	assert.Equal(t, int32(1), f.calls("ds", "typo"), "failures are cached within the TTL")
 	assert.Empty(t, f.router.writers())
 
-	now = now.Add(initFailureTTL)
-	delete(f.failTables, streamName("ds", "typo"))
+	f.clock.advance(initFailureTTL)
+	f.unfailTable("ds", "typo")
 	tw, err := f.router.resolve("app.typo")
 	require.NoError(t, err)
 	assert.NotNil(t, tw)
@@ -326,7 +302,7 @@ func TestTableRouterPreloadTables(t *testing.T) {
 
 func TestTableRouterPreloadTablesFailures(t *testing.T) {
 	f := newRouterFixture(t, "ds", "$TAG[1]", func(c *outputConfig) { c.preloadTables = []string{"missing"} })
-	f.failTables[streamName("ds", "missing")] = errors.New("rpc error: code = NotFound")
+	f.failTable("ds", "missing", errors.New("rpc error: code = NotFound"))
 	assert.Error(t, f.router.init(), "a missing preload table fails init like a static table does")
 
 	f = newRouterFixture(t, "$TAG[0]", "$TAG[1]", func(c *outputConfig) { c.preloadTables = []string{"orders"} })
@@ -344,29 +320,21 @@ func TestTableRouterCloseAll(t *testing.T) {
 		require.NoError(t, err)
 	}
 	assert.False(t, f.router.closeAll(context.Background()))
-	assert.Equal(t, int32(3), f.closedStreams.Load())
+	assert.Equal(t, int32(3), f.stream.closes.Load())
 }
 
-// registerTestConfig puts cfg into configMap and makes getFLBPluginContext resolve the
-// returned pointer to its id. The caller passes the pointer as the ctx of FLBPluginFlushCtx.
+// registerTestConfig puts cfg into configMap (as FLBPluginInit would) and returns a pointer
+// that the fake bridge resolves to its id. The caller passes it as the ctx of FLBPluginFlushCtx.
 func registerTestConfig(t *testing.T, cfg *outputConfig) unsafe.Pointer {
 	t.Helper()
+	bridge, ok := deps.flb.(*fakeBridge)
+	require.True(t, ok, "installTestDeps must be called first")
 	id := int(configID.Add(1) - 1)
 	configMap[id] = cfg
-	idPtr := new(int)
-	*idPtr = id
-	orig := getFLBPluginContext
-	getFLBPluginContext = func(ctx unsafe.Pointer) int {
-		if ctx != nil {
-			return *(*int)(ctx)
-		}
-		return 0
-	}
-	t.Cleanup(func() {
-		getFLBPluginContext = orig
-		delete(configMap, id)
-	})
-	return unsafe.Pointer(idPtr)
+	ptr := unsafe.Pointer(new(int))
+	bridge.SetContext(ptr, id)
+	t.Cleanup(func() { delete(configMap, id) })
+	return ptr
 }
 
 func TestFLBPluginFlushCtxUnknownTableAction(t *testing.T) {
@@ -382,7 +350,7 @@ func TestFLBPluginFlushCtxUnknownTableAction(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newRouterFixture(t, "ds", "$TAG[1]", func(c *outputConfig) { c.unknownTable = tt.action })
 			require.NoError(t, f.router.init())
-			f.failTables[streamName("ds", "typo")] = errors.New("rpc error: code = NotFound")
+			f.failTable("ds", "typo", errors.New("rpc error: code = NotFound"))
 			ptr := registerTestConfig(t, f.cfg)
 
 			tag := []byte("app.typo\x00")

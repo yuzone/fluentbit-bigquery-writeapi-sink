@@ -23,7 +23,6 @@ import (
 	"unsafe"
 
 	"cloud.google.com/go/bigquery/storage/managedwriter"
-	"github.com/fluent/fluent-bit-go/output"
 )
 
 const (
@@ -85,6 +84,7 @@ type outputConfig struct {
 
 	client ManagedWriterClient
 	router *tableRouter
+	clock  clock
 
 	// instanceCtx is a long-lived context, scoped to the lifetime of the output instance,
 	// used for AppendRows and managed stream creation. Unlike the per-flush context, it is not
@@ -96,8 +96,8 @@ type outputConfig struct {
 }
 
 // This function gets the value of various configuration fields and returns an error if the field could not be parsed
-func getConfigField[T int | bool](plugin unsafe.Pointer, key string, defaultval T) (T, error) {
-	currstr := output.FLBPluginConfigKey(plugin, key)
+func getConfigField[T int | bool](flb flbBridge, plugin unsafe.Pointer, key string, defaultval T) (T, error) {
+	currstr := flb.ConfigKey(plugin, key)
 	finval := defaultval
 	if currstr != "" {
 		switch any(defaultval).(type) {
@@ -122,41 +122,41 @@ func getConfigField[T int | bool](plugin unsafe.Pointer, key string, defaultval 
 
 // parseOutputConfig reads every configuration key of the output instance. The returned
 // error message is intended to be logged as-is by FLBPluginInit.
-func parseOutputConfig(plugin unsafe.Pointer) (*outputConfig, error) {
+func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, error) {
 	cfg := &outputConfig{
-		projectID: output.FLBPluginConfigKey(plugin, "ProjectID"),
+		projectID: flb.ConfigKey(plugin, "ProjectID"),
 	}
 
 	var err error
-	if cfg.datasetTemplate, err = parseTagTemplate(output.FLBPluginConfigKey(plugin, "DatasetID")); err != nil {
+	if cfg.datasetTemplate, err = parseTagTemplate(flb.ConfigKey(plugin, "DatasetID")); err != nil {
 		return nil, fmt.Errorf("Invalid DatasetId parameter in configuration file: %w", err)
 	}
-	if cfg.tableTemplate, err = parseTagTemplate(output.FLBPluginConfigKey(plugin, "TableID")); err != nil {
+	if cfg.tableTemplate, err = parseTagTemplate(flb.ConfigKey(plugin, "TableID")); err != nil {
 		return nil, fmt.Errorf("Invalid TableId parameter in configuration file: %w", err)
 	}
-	cfg.tagDelimiters = output.FLBPluginConfigKey(plugin, "Tag_Delimiters")
+	cfg.tagDelimiters = flb.ConfigKey(plugin, "Tag_Delimiters")
 	if cfg.tagDelimiters == "" {
 		cfg.tagDelimiters = tagDelimitersDefault
 	}
-	for _, t := range strings.Split(output.FLBPluginConfigKey(plugin, "Preload_Tables"), ",") {
+	for _, t := range strings.Split(flb.ConfigKey(plugin, "Preload_Tables"), ",") {
 		if t = strings.TrimSpace(t); t != "" {
 			cfg.preloadTables = append(cfg.preloadTables, t)
 		}
 	}
-	if cfg.unknownTable, err = parseUnknownTableAction(output.FLBPluginConfigKey(plugin, "Unknown_Table_Action")); err != nil {
+	if cfg.unknownTable, err = parseUnknownTableAction(flb.ConfigKey(plugin, "Unknown_Table_Action")); err != nil {
 		return nil, fmt.Errorf("Invalid Unknown_Table_Action parameter in configuration file: %w", err)
 	}
 
-	if cfg.exactlyOnce, err = getConfigField(plugin, "Exactly_Once", exactlyOnceDefault); err != nil {
+	if cfg.exactlyOnce, err = getConfigField(flb, plugin, "Exactly_Once", exactlyOnceDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Exactly_Once parameter in configuration file: %w", err)
 	}
 
 	// This value is only used when the exactly-once field is configured to true (as it describes synchronous retries)
-	if cfg.numRetries, err = getConfigField(plugin, "Num_Synchronous_Retries", numRetriesDefault); err != nil {
+	if cfg.numRetries, err = getConfigField(flb, plugin, "Num_Synchronous_Retries", numRetriesDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Num_Synchronous_Retries parameter in configuration file: %w", err)
 	}
 
-	if cfg.maxChunkSize, err = getConfigField(plugin, "Max_Chunk_Size", chunkSizeLimit); err != nil {
+	if cfg.maxChunkSize, err = getConfigField(flb, plugin, "Max_Chunk_Size", chunkSizeLimit); err != nil {
 		return nil, fmt.Errorf("Invalid Max_Chunk_Size parameter in configuration file: %w", err)
 	}
 	if cfg.maxChunkSize > chunkSizeLimit {
@@ -164,26 +164,26 @@ func parseOutputConfig(plugin unsafe.Pointer) (*outputConfig, error) {
 		cfg.maxChunkSize = chunkSizeLimit
 	}
 
-	if cfg.maxQueueRequests, err = getConfigField(plugin, "Max_Queue_Requests", queueRequestDefault); err != nil {
+	if cfg.maxQueueRequests, err = getConfigField(flb, plugin, "Max_Queue_Requests", queueRequestDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Max_Queue_Requests parameter in configuration file: %w", err)
 	}
-	cfg.requestCountThreshold = setThreshold(cfg.maxQueueRequests)
+	cfg.requestCountThreshold = requestCountThreshold(cfg.maxQueueRequests)
 
-	if cfg.maxQueueBytes, err = getConfigField(plugin, "Max_Queue_Bytes", queueByteDefault); err != nil {
+	if cfg.maxQueueBytes, err = getConfigField(flb, plugin, "Max_Queue_Bytes", queueByteDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Max_Queue_Bytes parameter in configuration file: %w", err)
 	}
 
-	if cfg.dateTimeStringType, err = getConfigField(plugin, "DateTime_String_Type", dateTimeDefault); err != nil {
+	if cfg.dateTimeStringType, err = getConfigField(flb, plugin, "DateTime_String_Type", dateTimeDefault); err != nil {
 		return nil, fmt.Errorf("Invalid DateTime_Input_Type parameter in configuration file: %w", err)
 	}
 
-	flushTimeoutSec, err := getConfigField(plugin, "Flush_Timeout_Sec", flushTimeoutSecDefault)
+	flushTimeoutSec, err := getConfigField(flb, plugin, "Flush_Timeout_Sec", flushTimeoutSecDefault)
 	if err != nil {
 		return nil, fmt.Errorf("Invalid Flush_Timeout_Sec parameter in configuration file: %w", err)
 	}
 	cfg.flushTimeout = time.Duration(flushTimeoutSec) * time.Second
 
-	if cfg.retryOnFailure, err = getConfigField(plugin, "Retry_On_Failure", retryOnFailureDefault); err != nil {
+	if cfg.retryOnFailure, err = getConfigField(flb, plugin, "Retry_On_Failure", retryOnFailureDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Retry_On_Failure parameter in configuration file: %w", err)
 	}
 
