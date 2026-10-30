@@ -459,3 +459,54 @@ func TestFLBPluginFlushCtxAppendUsesInstanceContext(t *testing.T) {
 	assert.Equal(t, output.FLB_OK, FLBPluginExitCtx(plugin))
 	assert.Error(t, captured.Err(), "instance-scoped context must be canceled after exit")
 }
+
+// TestFLBPluginInitMultiplexing verifies that the client is created with the multiplexing
+// options only when Enable_Multiplexing is set.
+func TestFLBPluginInitMultiplexing(t *testing.T) {
+	tests := []struct {
+		name string
+		keys map[string]string
+		want []option.ClientOption
+	}{
+		{name: "disabled by default", keys: nil, want: nil},
+		{
+			name: "enabled with default pool limit",
+			keys: map[string]string{"Enable_Multiplexing": "true"},
+			want: []option.ClientOption{managedwriter.WithMultiplexing(), managedwriter.WithMultiplexPoolLimit(1)},
+		},
+		{
+			name: "enabled with pool limit",
+			keys: map[string]string{"Enable_Multiplexing": "true", "Multiplex_Pool_Limit": "4"},
+			want: []option.ClientOption{managedwriter.WithMultiplexing(), managedwriter.WithMultiplexPoolLimit(4)},
+		},
+		{
+			name: "pool limit ignored when disabled",
+			keys: map[string]string{"Multiplex_Pool_Limit": "4"},
+			want: nil,
+		},
+		{
+			name: "exactly-once only warns",
+			keys: map[string]string{"Enable_Multiplexing": "true", "Exactly_Once": "True"},
+			want: []option.ClientOption{managedwriter.WithMultiplexing(), managedwriter.WithMultiplexPoolLimit(1)},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := installTestDeps(t, defaultInitKeys(tt.keys))
+			initPlugin(t)
+			require.Len(t, d.clientOpts, 1)
+			assert.Equal(t, tt.want, d.clientOpts[0])
+		})
+	}
+}
+
+func TestFLBPluginInitMultiplexingInvalid(t *testing.T) {
+	for _, keys := range []map[string]string{
+		{"Enable_Multiplexing": "maybe"},
+		{"Multiplex_Pool_Limit": "0"},
+		{"Multiplex_Pool_Limit": "x"},
+	} {
+		installTestDeps(t, defaultInitKeys(keys))
+		assert.Equal(t, output.FLB_ERROR, FLBPluginInit(unsafe.Pointer(new(int))), keys)
+	}
+}

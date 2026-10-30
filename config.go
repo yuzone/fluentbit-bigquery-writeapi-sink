@@ -23,6 +23,7 @@ import (
 	"unsafe"
 
 	"cloud.google.com/go/bigquery/storage/managedwriter"
+	"google.golang.org/api/option"
 )
 
 const (
@@ -39,6 +40,8 @@ const (
 	flushTimeoutSecDefault     = 10         // default Flush_Timeout_Sec: 10 seconds per flush call
 	tagDelimitersDefault       = "."        // default Tag_Delimiters used to split the tag for $TAG[n]
 	retryOnFailureDefault      = true       // default Retry_On_Failure: return FLB_RETRY for transient append failures
+	enableMultiplexingDefault  = false      // default Enable_Multiplexing: one gRPC connection per default stream
+	multiplexPoolLimitDefault  = 1          // default Multiplex_Pool_Limit: connections per region when multiplexing
 )
 
 // unknownTableAction is what FLBPluginFlushCtx does when the table resolved from the tag
@@ -81,6 +84,8 @@ type outputConfig struct {
 	dateTimeStringType    bool
 	flushTimeout          time.Duration
 	retryOnFailure        bool
+	enableMultiplexing    bool
+	multiplexPoolLimit    int
 
 	client ManagedWriterClient
 	router *tableRouter
@@ -187,6 +192,19 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 		return nil, fmt.Errorf("Invalid Retry_On_Failure parameter in configuration file: %w", err)
 	}
 
+	if cfg.enableMultiplexing, err = getConfigField(flb, plugin, "Enable_Multiplexing", enableMultiplexingDefault); err != nil {
+		return nil, fmt.Errorf("Invalid Enable_Multiplexing parameter in configuration file: %w", err)
+	}
+	if cfg.multiplexPoolLimit, err = getConfigField(flb, plugin, "Multiplex_Pool_Limit", multiplexPoolLimitDefault); err != nil {
+		return nil, fmt.Errorf("Invalid Multiplex_Pool_Limit parameter in configuration file: %w", err)
+	}
+	if cfg.multiplexPoolLimit < 1 {
+		return nil, fmt.Errorf("Invalid Multiplex_Pool_Limit parameter in configuration file: must be >= 1, got %d", cfg.multiplexPoolLimit)
+	}
+	if cfg.enableMultiplexing && cfg.exactlyOnce {
+		log.Printf("Enable_Multiplexing is set together with Exactly_Once; committed streams cannot be multiplexed, so the option has no effect on this output")
+	}
+
 	// Set the stream type based on exactly once parameter
 	if cfg.exactlyOnce {
 		cfg.streamType = managedwriter.CommittedStream
@@ -196,4 +214,15 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 	}
 
 	return cfg, nil
+}
+
+// clientOptions returns the managedwriter client options derived from the configuration.
+func (cfg *outputConfig) clientOptions() []option.ClientOption {
+	if !cfg.enableMultiplexing {
+		return nil
+	}
+	return []option.ClientOption{
+		managedwriter.WithMultiplexing(),
+		managedwriter.WithMultiplexPoolLimit(cfg.multiplexPoolLimit),
+	}
 }

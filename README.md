@@ -118,6 +118,8 @@ Keys are matched case-insensitively by Fluent Bit.
 | `DateTime_String_Type` | bool | `true` | `true` accepts `DATETIME` values as strings. `false` accepts civil-time encoded `int64`. Applies to nested `DATETIME` fields as well; `RANGE<DATETIME>` always expects `int64`. |
 | `Flush_Timeout_Sec` | int (seconds) | `10` | Deadline for a single flush call (and for draining pending responses on exit). |
 | `Retry_On_Failure` | bool | `true` | `true` returns `FLB_RETRY` / `FLB_ERROR` to Fluent Bit when an append fails (see [Delivery semantics](#delivery-semantics)). `false` restores the historical behaviour of logging the failure and acknowledging the chunk. |
+| `Enable_Multiplexing` | bool | `false` | **EXPERIMENTAL.** Share gRPC connections between default streams of this output (see [Connection multiplexing](#connection-multiplexing)). |
+| `Multiplex_Pool_Limit` | int | `1` | **EXPERIMENTAL.** Maximum shared connections per BigQuery region when `Enable_Multiplexing` is `true`; ignored otherwise. Must be `>= 1`. |
 
 Boolean values are parsed with Go's `strconv.ParseBool` (`true`/`false`,
 `1`/`0`, `t`/`f`, …). An unparsable value fails plugin initialisation.
@@ -236,6 +238,38 @@ synchronously, so the queue never grows beyond a single flush.
 Backpressure towards inputs is handled by Fluent Bit's own buffering
 (`Mem_Buf_Limit`, `storage.type filesystem`); see
 [Buffering & Storage](https://docs.fluentbit.io/manual/administration/buffering-and-storage).
+
+### Connection multiplexing
+
+By default every default stream owns its own gRPC connection. With
+[routing by tag](#routing-by-tag) one output may hold `tables × up to 10`
+streams, and each connection counts against the Storage Write API
+concurrent-connection quota of the project/region.
+
+`Enable_Multiplexing true` passes `managedwriter.WithMultiplexing()` when the
+client is created, so default streams of the output share a per-region
+connection pool whose size is capped by `Multiplex_Pool_Limit`
+(`WithMultiplexPoolLimit`). The pool grows up to the limit only when there is
+enough traffic on the shared connection(s).
+
+```
+[OUTPUT]
+    Name                 writeapi
+    Match                app.*
+    ProjectID            my-project
+    DatasetId            logs
+    TableId              $TAG[1]
+    Enable_Multiplexing  true
+    Multiplex_Pool_Limit 2
+```
+
+Notes:
+
+- Google marks these client options as **EXPERIMENTAL and subject to change**;
+  the plugin keeps them opt-in for that reason.
+- Only default streams can be multiplexed. With `Exactly_Once true` (committed
+  streams) the option has no effect and a warning is logged at start-up.
+- `Max_Queue_Requests` / `Max_Queue_Bytes` still apply per stream.
 
 ## Releases and versioning
 

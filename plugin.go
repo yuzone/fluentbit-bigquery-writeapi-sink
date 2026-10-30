@@ -109,7 +109,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	// creation, stream creation (buildStream) and AppendRows ensures the managed writer's internal
 	// retry/reconnect logic is not aborted when a per-flush context is canceled at flush end.
 	cfg.instanceCtx, cfg.instanceCancel = context.WithCancel(context.Background())
-	cfg.client, err = deps.newClient(cfg.instanceCtx, cfg.projectID)
+	cfg.client, err = deps.newClient(cfg.instanceCtx, cfg.projectID, cfg.clientOptions()...)
 	if err != nil {
 		cfg.instanceCancel()
 		log.Printf("Creating a new managed BigQuery Storage write client scoped to: %s failed in FLBPluginInit: %s", cfg.projectID, err)
