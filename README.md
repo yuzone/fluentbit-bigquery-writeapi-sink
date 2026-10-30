@@ -109,7 +109,7 @@ Keys are matched case-insensitively by Fluent Bit.
 | `TableId` | string | (required) | BigQuery table. May contain `$TAG` / `$TAG[n]`. Without placeholders the schema is fetched once at startup and a missing table fails initialisation. |
 | `Tag_Delimiters` | string | `.` | Characters on which the tag is split for `$TAG[n]`. Every character in the value is a delimiter; empty parts are dropped. |
 | `Preload_Tables` | string | *(empty)* | Comma-separated table IDs to initialise at startup when `TableId` is tag-based. A missing preload table fails initialisation, restoring the start-up validation a static `TableId` provides. Requires a static `DatasetId`. |
-| `Unknown_Table_Action` | string | `drop` | What to do with a chunk whose table cannot be resolved or initialised: `drop` logs and acknowledges the chunk (`FLB_OK`); `retry` returns `FLB_RETRY` so Fluent Bit redelivers it. A **transient** initialisation failure (backend unreachable, `Init_Timeout_Sec` exceeded) is not an unknown table: it is retried like a transient append failure regardless of this setting. |
+| `Unknown_Table_Action` | string | `drop` | What to do with a chunk whose table cannot be resolved or initialised: `drop` logs and acknowledges the chunk (`FLB_OK`); `retry` returns `FLB_RETRY` so Fluent Bit redelivers it. A **transient** initialisation failure (backend unreachable, `Init_Timeout_Sec` exceeded) is not an unknown table: it is retried like a transient append failure regardless of this setting. A tag that cannot be mapped to a table at all (`$TAG[n]` out of range, invalid dataset/table ID) is always dropped, because redelivering the same tag could never succeed. |
 | `Exactly_Once` | bool | `false` | `true` uses a committed stream with synchronous response checking (exactly-once). `false` uses the default stream with asynchronous response checking (at-least-once). |
 | `Num_Synchronous_Retries` | int | `4` | Maximum synchronous retries per append when `Exactly_Once` is `true`. Ignored otherwise. |
 | `Max_Chunk_Size` | int (bytes) | `9437184` (9 MiB) | Upper bound on the serialized size of a single `AppendRows` request. Values above 9 MiB are clamped to 9 MiB. |
@@ -202,7 +202,7 @@ Fluent Bit return codes:
 
 | Code | When | Fluent Bit reaction |
 |---|---|---|
-| `FLB_OK` | Every `AppendRows` call of the chunk was accepted (or handed to the default stream). Also returned when `Retry_On_Failure` is `false`, and for unknown tables with `Unknown_Table_Action drop`. | Chunk is acknowledged and released. |
+| `FLB_OK` | Every `AppendRows` call of the chunk was accepted (or handed to the default stream). Also returned when `Retry_On_Failure` is `false`, for unknown tables with `Unknown_Table_Action drop`, and for tags that cannot be mapped to a table (logged and dropped regardless of `Unknown_Table_Action`). | Chunk is acknowledged and released. |
 | `FLB_RETRY` | A **transient** failure: gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`, `INTERNAL`, `CANCELLED`, connection errors, `io.EOF`, context deadline/cancellation. Also returned for unknown tables with `Unknown_Table_Action retry`. | Chunk is kept in the buffer and redelivered according to `Retry_Limit` / `scheduler.*`. |
 | `FLB_ERROR` | A **permanent** failure: `INVALID_ARGUMENT` (for example schema mismatch), `PERMISSION_DENIED`, `NOT_FOUND`, and any other error. | Chunk is dropped and counted in the output's error metrics. |
 

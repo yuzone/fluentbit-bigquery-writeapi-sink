@@ -230,11 +230,16 @@ func TestTableRouterUnknownTable(t *testing.T) {
 	require.NoError(t, f.router.init())
 
 	_, err := f.router.resolve("onlyonepart")
-	assert.Error(t, err, "index out of range")
+	assert.ErrorIs(t, err, errBadTag, "index out of range")
 
 	_, err = f.router.resolve("app.has/slash")
-	assert.Error(t, err, "invalid table id")
+	assert.ErrorIs(t, err, errBadTag, "invalid table id")
 	assert.Equal(t, int32(0), f.calls("ds", "has/slash"), "invalid IDs never reach BigQuery")
+
+	f.failTable("ds", "typo", errors.New("rpc error: code = NotFound"))
+	_, err = f.router.resolve("app.typo")
+	assert.Error(t, err)
+	assert.NotErrorIs(t, err, errBadTag, "a missing table is not a tag problem")
 }
 
 func TestTableRouterCustomDelimiters(t *testing.T) {
@@ -358,6 +363,11 @@ func TestFLBPluginFlushCtxUnknownTableAction(t *testing.T) {
 			got := FLBPluginFlushCtx(ptr, nil, 0, (*cChar)(unsafe.Pointer(&tag[0])))
 			assert.Equal(t, tt.want, got)
 			assert.Equal(t, int32(1), f.calls("ds", "typo"))
+
+			// A tag that cannot be mapped to a table is dropped even with "retry": redelivering
+			// the same tag would fail forever.
+			bad := []byte("onlyonepart\x00")
+			assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, nil, 0, (*cChar)(unsafe.Pointer(&bad[0]))))
 		})
 	}
 }

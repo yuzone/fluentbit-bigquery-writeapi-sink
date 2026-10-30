@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -23,6 +24,11 @@ import (
 // initFailureTTL is how long a failed table initialization (e.g. NOT_FOUND) is remembered
 // before the next flush for that table retries GetWriteStream.
 const initFailureTTL = 60 * time.Second
+
+// errBadTag marks a resolve failure that is decided by the tag alone ($TAG[n] out of range,
+// invalid dataset/table ID). Redelivering the chunk cannot fix it, so FLBPluginFlushCtx drops
+// such chunks regardless of Unknown_Table_Action.
+var errBadTag = errors.New("tag cannot be mapped to a table")
 
 // writerEntry is one slot of the router map. done is closed once initialization finished;
 // tw/err/failedAt are written under tableRouter.mu before done is closed.
@@ -93,17 +99,17 @@ func (r *tableRouter) resolve(tag string) (*tableWriter, error) {
 	}
 	dataset, err := r.cfg.datasetTemplate.render(tag, r.cfg.tagDelimiters)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errBadTag, err)
 	}
 	table, err := r.cfg.tableTemplate.render(tag, r.cfg.tagDelimiters)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errBadTag, err)
 	}
 	if !validDatasetID(dataset) {
-		return nil, fmt.Errorf("tag %q resolved to invalid dataset ID %q", tag, dataset)
+		return nil, fmt.Errorf("%w: tag %q resolved to invalid dataset ID %q", errBadTag, tag, dataset)
 	}
 	if !validTableID(table) {
-		return nil, fmt.Errorf("tag %q resolved to invalid table ID %q", tag, table)
+		return nil, fmt.Errorf("%w: tag %q resolved to invalid table ID %q", errBadTag, tag, table)
 	}
 	return r.writerFor(dataset, table)
 }

@@ -127,6 +127,9 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	cfg.router = newTableRouter(cfg, id)
 	if err := cfg.router.init(); err != nil {
 		cfg.instanceCancel()
+		if closeErr := cfg.client.Close(); closeErr != nil {
+			log.Printf("FLBPluginInit: closing client after failed initialization: %s", closeErr)
+		}
 		log.Printf("FLBPluginInit: %s", err)
 		return output.FLB_ERROR
 	}
@@ -249,9 +252,15 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	tw, err := config.router.resolve(tagStr)
 	if err != nil {
 		log.Printf("Resolving destination table for output instance with id: %d and tag %q failed in FLBPluginFlushCtx: %s", id, tagStr, err)
-		// A transient failure means the backend could not be reached, not that the table is
-		// unknown, so it is handled like a transient append failure.
-		if config.unknownTable == unknownTableRetry || (config.retryOnFailure && isTransientError(err)) {
+		switch {
+		case errors.Is(err, errBadTag):
+			// Decided by the tag alone; redelivering the chunk cannot change the outcome.
+			return output.FLB_OK
+		case config.unknownTable == unknownTableRetry:
+			return output.FLB_RETRY
+		case config.retryOnFailure && isTransientError(err):
+			// A transient failure means the backend could not be reached, not that the table is
+			// unknown, so it is handled like a transient append failure.
 			return output.FLB_RETRY
 		}
 		return output.FLB_OK
