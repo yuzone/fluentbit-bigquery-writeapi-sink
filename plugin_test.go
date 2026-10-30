@@ -235,6 +235,70 @@ func TestFLBPluginFlushCtxBlockedAppendExactlyOnceAdvancesOffset(t *testing.T) {
 	assert.Equal(t, int32(0), tw.blockedAppends.Load())
 }
 
+// Exactly-once: AppendRows returned but the server response does not arrive within the flush
+// timeout. The rows are committed at the offset that was used, so the flush must report the
+// append as blocked (FLB_RETRY, fail fast until the response arrives) and advance the counter
+// when it does, instead of leaving the counter behind and having every later append rejected
+// with OFFSET_ALREADY_EXISTS.
+func TestFLBPluginFlushCtxExactlyOnceLateResponseAdvancesOffset(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.retryOnFailure = true
+		c.exactlyOnce = true
+		c.streamType = managedwriter.CommittedStream
+		c.numRetries = 3
+		c.flushTimeout = 50 * time.Millisecond
+	})
+	require.NoError(t, f.router.init())
+	pending := pendingResult()
+	pending.offset = 0
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) { return pending, nil })
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"}, map[string]interface{}{"Text": "b"})
+	tw := f.router.static
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, int32(1), f.appendCalls(), "a late response is not retried synchronously")
+	assert.Equal(t, int32(1), tw.blockedAppends.Load())
+	assert.Equal(t, int64(0), tw.offset(), "the counter is not advanced before the response arrives")
+	assert.Empty(t, f.clock.sleeps)
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")), "fails fast while the response is pending")
+	assert.Equal(t, int32(1), f.appendCalls(), "no append is started at a possibly stale offset")
+
+	close(pending.ready)
+	require.Eventually(t, func() bool { return tw.offset() == 2 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return tw.blockedAppends.Load() == 0 }, time.Second, time.Millisecond)
+
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) { return readyResult(2, nil), nil })
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, int32(2), f.appendCalls())
+	assert.Equal(t, int64(4), tw.offset(), "the redelivered chunk is accounted from the advanced offset")
+}
+
+// Exactly-once: a late response that turns out to be a rejection must not advance the counter.
+func TestFLBPluginFlushCtxExactlyOnceLateRejectionKeepsOffset(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.retryOnFailure = true
+		c.exactlyOnce = true
+		c.streamType = managedwriter.CommittedStream
+		c.flushTimeout = 50 * time.Millisecond
+	})
+	require.NoError(t, f.router.init())
+	pending := pendingResult()
+	pending.err = status.Error(codes.InvalidArgument, "schema mismatch")
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) { return pending, nil })
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"})
+	tw := f.router.static
+
+	assert.Equal(t, output.FLB_RETRY, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	require.Equal(t, int32(1), tw.blockedAppends.Load())
+
+	close(pending.ready)
+	require.Eventually(t, func() bool { return tw.blockedAppends.Load() == 0 }, time.Second, time.Millisecond)
+	assert.Equal(t, int64(0), tw.offset())
+}
+
 // During an outage the managed writer's Close waits for a connection lock held by the blocked
 // AppendRows, which only cancelling the instance context releases. FLBPluginExitCtx must drain
 // the responses of acknowledged appends, then cancel before closing when an append is blocked,
@@ -744,23 +808,27 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 // is invalid: an INVALID_ARGUMENT status carrying a StorageError INVALID_STREAM_TYPE detail.
 func invalidStreamTypeErr(t *testing.T) error {
 	t.Helper()
-	st, err := status.New(codes.InvalidArgument, "invalid stream").WithDetails(
-		&storagepb.StorageError{Code: storagepb.StorageError_INVALID_STREAM_TYPE})
+	return storageErr(t, storagepb.StorageError_INVALID_STREAM_TYPE)
+}
+
+// storageErr builds an INVALID_ARGUMENT status carrying the given StorageError code.
+func storageErr(t *testing.T, code storagepb.StorageError_StorageErrorCode) error {
+	t.Helper()
+	st, err := status.New(codes.InvalidArgument, code.String()).WithDetails(&storagepb.StorageError{Code: code})
 	require.NoError(t, err)
 	return st.Err()
 }
 
 func TestRebuildPredicate(t *testing.T) {
-	otherDetail, err := status.New(codes.InvalidArgument, "x").WithDetails(
-		&storagepb.StorageError{Code: storagepb.StorageError_STREAM_NOT_FOUND})
-	require.NoError(t, err)
 	tests := []struct {
 		name string
 		err  error
 		want bool
 	}{
 		{"invalid stream type detail", invalidStreamTypeErr(t), true},
-		{"other storage error detail", otherDetail.Err(), false},
+		{"offset already exists detail", storageErr(t, storagepb.StorageError_OFFSET_ALREADY_EXISTS), true},
+		{"offset out of range detail", storageErr(t, storagepb.StorageError_OFFSET_OUT_OF_RANGE), true},
+		{"other storage error detail", storageErr(t, storagepb.StorageError_STREAM_NOT_FOUND), false},
 		{"status without details", status.Error(codes.InvalidArgument, "x"), false},
 		{"plain error", errors.New("boom"), false},
 		{"nil", nil, false},
@@ -830,6 +898,26 @@ func TestFLBPluginFlushCtxExactlyOnceRebuildsInvalidStream(t *testing.T) {
 	assert.Equal(t, int32(1), rebuilt.appends.Load(), "the chunk is appended to the new stream in the same flush")
 	assert.Equal(t, int64(2), tw.offset(), "the offset restarts at 0 on the new stream")
 	assert.Empty(t, f.clock.sleeps, "the rebuild does not count as a retry attempt")
+}
+
+// Safety net: should the offset counter ever diverge from the backend's, the rejection
+// (OFFSET_ALREADY_EXISTS) replaces the committed stream instead of dropping this and every
+// later chunk of the table with FLB_ERROR.
+func TestFLBPluginFlushCtxExactlyOnceRebuildsOnOffsetMismatch(t *testing.T) {
+	f := newExactlyOnceFixture(t, nil)
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "a"})
+	tw := f.router.static
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		return readyResult(-1, storageErr(t, storagepb.StorageError_OFFSET_ALREADY_EXISTS)), nil
+	})
+
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, int32(1), f.stream.finalizes.Load())
+	require.Len(t, f.client.streams, 2, "one stream is rebuilt")
+	assert.Same(t, f.client.streams[1], currentStream(tw))
+	assert.Equal(t, int32(1), f.client.streams[1].appends.Load())
+	assert.Equal(t, int64(1), tw.offset(), "the counter restarts with the new stream")
 }
 
 // A rebuilt stream that is rejected the same way is not rebuilt again within the flush: the
