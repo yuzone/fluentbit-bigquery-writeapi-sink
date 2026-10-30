@@ -419,14 +419,23 @@ func (tw *tableWriter) newManagedStream(ctx context.Context) (MWManagedStream, e
 	}
 }
 
-// rebuildPredicate reports whether an append was rejected because the committed stream itself
-// is no longer valid (StorageError INVALID_STREAM_TYPE), in which case it must be replaced.
+// rebuildPredicate reports whether an append was rejected because the committed stream can no
+// longer be used as is, in which case it must be replaced: the stream itself is invalid
+// (StorageError INVALID_STREAM_TYPE), or the offset counter has diverged from the offset the
+// backend expects (OFFSET_ALREADY_EXISTS, OFFSET_OUT_OF_RANGE). The latter should not happen
+// since late appends advance the counter, but if it does a new stream (offset 0) costs at most
+// one duplicated chunk, whereas keeping the stale counter would drop every later chunk.
 // ExtractProtoMessage returns nil when the detail was found.
 func rebuildPredicate(err error) bool {
 	if apiErr, ok := apierror.FromError(err); ok {
 		storageErr := &storagepb.StorageError{}
 		if e := apiErr.Details().ExtractProtoMessage(storageErr); e == nil {
-			return storageErr.GetCode() == storagepb.StorageError_INVALID_STREAM_TYPE
+			switch storageErr.GetCode() {
+			case storagepb.StorageError_INVALID_STREAM_TYPE,
+				storagepb.StorageError_OFFSET_ALREADY_EXISTS,
+				storagepb.StorageError_OFFSET_OUT_OF_RANGE:
+				return true
+			}
 		}
 	}
 	return false
@@ -482,6 +491,13 @@ func (tw *tableWriter) rebuildStream(ctx context.Context, streamIndex int) error
 // sendRequestExactlyOnce sends and checks the response for data through a committed stream.
 // On success the stream's offsetCounter is incremented by len(data) within the same streamMu
 // critical section as the append, preventing TOCTOU races when workers > 1.
+//
+// The response wait is bounded by the per-flush ctx like the AppendRows call itself. The rows
+// of an append whose response has not arrived by then are usually committed at the offset
+// that was used, so the flush must not simply fail: the counter would stay behind and every
+// later append, starting with the redelivered chunk, would be rejected with
+// OFFSET_ALREADY_EXISTS. Instead the append is treated as blocked (errAppendBlocked, see
+// appendRows) and late advances the counter once the response arrives.
 func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte, streamIndex int) error {
 	tw.streamMu.Lock()
 	defer tw.streamMu.Unlock()
@@ -510,13 +526,26 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 			currStream.offsetCounter += int64(len(data))
 		}
 	}
+	started := time.Now()
 	result, err := tw.appendRows(ctx, ms, data, late, managedwriter.WithOffset(currStream.offsetCounter))
 	if err != nil {
 		return err
 	}
 	// Synchronously check the response immediately after appending data with exactly once semantics
-	_, err = getResult(result, ctx)
-	if err != nil {
+	select {
+	case <-result.Ready():
+	case <-ctx.Done():
+		// Both may be ready at once; only give up when the response is really missing.
+		if !isReady(result) {
+			return tw.blockAppend(started, len(data), "the response of AppendRows", func() appendOutcome {
+				<-result.Ready()
+				return appendOutcome{result: result}
+			}, late)
+		}
+	}
+	// The response is in, so GetResult returns at once; tw.ctx keeps an expired flush ctx from
+	// turning a committed append into a failure that leaves the counter behind.
+	if _, err = getResult(result, tw.ctx); err != nil {
 		return err
 	}
 	// Increment the offset inside the same lock so no other worker can read a stale offset value.
@@ -525,8 +554,9 @@ func (tw *tableWriter) sendRequestExactlyOnce(ctx context.Context, data [][]byte
 }
 
 // sendRequestRetries enables synchronous retries and rebuilding a valid stream based on the server response.
-// An append rejected with INVALID_STREAM_TYPE (or made while the stream has no usable managed
-// stream) triggers rebuildStream and is retried once on the new stream without counting as an
+// An append rejected with a StorageError recognised by rebuildPredicate (INVALID_STREAM_TYPE,
+// OFFSET_ALREADY_EXISTS, OFFSET_OUT_OF_RANGE), or made while the stream has no usable managed
+// stream, triggers rebuildStream and is retried once on the new stream without counting as an
 // attempt. At most one rebuild is performed per flush so that a backend that keeps rejecting
 // the new stream cannot keep this flush looping: the second rejection is returned as is, and
 // being INVALID_ARGUMENT it is a permanent failure (the chunk is dropped with FLB_ERROR, or
@@ -629,15 +659,24 @@ func (tw *tableWriter) appendRows(ctx context.Context, ms MWManagedStream, data 
 	case <-ctx.Done():
 	}
 
+	return nil, tw.blockAppend(started, len(data), "AppendRows", func() appendOutcome { return <-done }, late)
+}
+
+// blockAppend records an append whose outcome is still unknown when the flush deadline expired
+// and returns the errAppendBlocked the flush reports. wait runs in the background until the
+// outcome is known; it is handed to late before appends for the table resume. The outcome
+// becomes known either when AppendRows returns (see appendRows) or, for committed streams,
+// when the response of a returned AppendRows arrives (see sendRequestExactlyOnce).
+func (tw *tableWriter) blockAppend(started time.Time, rows int, what string, wait func() appendOutcome, late func(appendResult, error)) error {
 	tw.blockedAppends.Add(1)
 	go func() {
-		o := <-done
-		log.Printf("Blocked append of %d rows to table %s for output instance with id: %d returned after %s (error: %v); resuming appends", len(data), tw.tableRef, tw.id, time.Since(started).Round(time.Millisecond), o.err)
+		o := wait()
+		log.Printf("Blocked append of %d rows to table %s for output instance with id: %d returned after %s (error: %v); resuming appends", rows, tw.tableRef, tw.id, time.Since(started).Round(time.Millisecond), o.err)
 		// Record the outcome before appends resume so that the next flush sees it.
 		late(o.result, o.err)
 		tw.blockedAppends.Add(-1)
 	}()
-	return nil, fmt.Errorf("%w: AppendRows did not return within %s (%d rows left in flight)", errAppendBlocked, time.Since(started).Round(time.Millisecond), len(data))
+	return fmt.Errorf("%w: %s did not return within %s (%d rows left in flight)", errAppendBlocked, what, time.Since(started).Round(time.Millisecond), rows)
 }
 
 // flush picks the least-loaded stream and sends data through it, using the exactly-once or

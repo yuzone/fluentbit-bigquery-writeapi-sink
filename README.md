@@ -232,15 +232,23 @@ Which failures are visible at flush time depends on the mode:
   way (`FLB_RETRY`, not `Unknown_Table_Action`).
 - **Committed stream (`Exactly_Once true`)**: every append is confirmed
   synchronously and retried up to `Num_Synchronous_Retries` times for
-  transient errors before the chunk is reported as `FLB_RETRY`. When the
+  transient errors before the chunk is reported as `FLB_RETRY`. If the server
+  response has not arrived within `Flush_Timeout_Sec`, the rows are usually
+  committed at the offset that was used, so the append is handled like a
+  blocked one: the chunk is reported as `FLB_RETRY`, flushes for that table
+  fail fast until the response arrives, and the offset counter is advanced
+  from it before appends resume (the redelivered chunk lands at the next
+  offset, which is the one duplicated chunk described above). When the
   backend rejects an append because the stream itself is no longer valid
-  (`INVALID_STREAM_TYPE`), the stream is finalized, closed and replaced by a
-  new committed stream (offset 0) and the chunk is appended to it within the
-  same flush. At most one rebuild happens per flush: if the new stream is
-  rejected the same way, the chunk is treated as a permanent failure
-  (`FLB_ERROR`). If the backend is unreachable while rebuilding, the flush is
-  reported as `FLB_RETRY` and the next flush of that table rebuilds the stream
-  before appending.
+  (`INVALID_STREAM_TYPE`), or because the plugin's offset no longer matches
+  the stream's (`OFFSET_ALREADY_EXISTS`, `OFFSET_OUT_OF_RANGE`), the stream
+  is finalized, closed and replaced by a new committed stream (offset 0) and
+  the chunk is appended to it within the same flush; an offset mismatch thus
+  costs at most one duplicated chunk instead of stalling the table. At most
+  one rebuild happens per flush: if the new stream is rejected the same way,
+  the chunk is treated as a permanent failure (`FLB_ERROR`). If the backend
+  is unreachable while rebuilding, the flush is reported as `FLB_RETRY` and
+  the next flush of that table rebuilds the stream before appending.
 
 A chunk larger than `Max_Chunk_Size` is sent as several `AppendRows` requests.
 When a transient failure occurs the plugin stops sending the remaining
