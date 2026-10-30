@@ -157,31 +157,38 @@ func TestFLBPluginFlushCtxExactlyOnceSynchronousRetriesFollowClassification(t *t
 	}
 }
 
-// A row whose serialized size alone reaches the AppendRows limit can never be sent; it is
-// logged and skipped like a row that cannot be serialized, and the rest of the chunk is
-// delivered normally.
+// A row whose serialized size alone reaches the 10 MB AppendRows request limit can never be
+// sent; it is logged and skipped like a row that cannot be serialized, and the rest of the
+// chunk is delivered normally. A row above Max_Chunk_Size but below that limit is still sent
+// on its own.
 func TestFLBPluginFlushCtxOversizedRowIsSkipped(t *testing.T) {
 	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.retryOnFailure = true })
 	require.NoError(t, f.router.init())
-	var appended [][]byte
+	var requests [][][]byte
 	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
-		appended = append(appended, data...)
+		// binaryData is reused between sub-chunks, so keep a copy of this request.
+		requests = append(requests, append([][]byte(nil), data...))
 		return readyResult(-1, nil), nil
 	})
 	ptr := registerTestConfig(t, f.cfg)
+	large := strings.Repeat("x", chunkSizeLimit) // above Max_Chunk_Size, below the request limit
 	data, n := encodeRecords(t,
 		map[string]interface{}{"Text": "a"},
-		map[string]interface{}{"Text": strings.Repeat("x", chunkSizeLimit)},
+		map[string]interface{}{"Text": strings.Repeat("y", appendRequestLimit)},
+		map[string]interface{}{"Text": large},
 		map[string]interface{}{"Text": "b"},
 	)
 
 	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
-	assert.Equal(t, int32(1), f.appendCalls())
-	assert.Equal(t, []string{"a", "b"}, f.textValues(t, appended))
+	require.Len(t, requests, 3)
+	assert.Equal(t, []string{"a"}, f.textValues(t, requests[0]))
+	assert.Equal(t, []string{large}, f.textValues(t, requests[1]), "a row above Max_Chunk_Size is sent alone")
+	assert.Equal(t, []string{"b"}, f.textValues(t, requests[2]))
 }
 
 // A msgpack object that is not a [timestamp, map] record must not end the chunk: the decoder
-// has consumed it, so the records after it are still delivered.
+// has consumed it, so the records after it are still delivered. This includes top-level
+// values on which output.GetRecord panics (nil, numbers, bools).
 func TestFLBPluginFlushCtxMalformedRecordIsSkipped(t *testing.T) {
 	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.retryOnFailure = true })
 	require.NoError(t, f.router.init())
@@ -196,6 +203,9 @@ func TestFLBPluginFlushCtxMalformedRecordIsSkipped(t *testing.T) {
 	require.NoError(t, enc.Encode([]interface{}{uint64(1700000000), map[string]interface{}{"Text": "a"}}))
 	require.NoError(t, enc.Encode([]interface{}{uint64(1700000000), map[string]interface{}{"Text": "x"}, "extra"}))
 	require.NoError(t, enc.Encode([]interface{}{uint64(1700000000), "not a map"}))
+	require.NoError(t, enc.Encode(nil))
+	require.NoError(t, enc.Encode(42))
+	require.NoError(t, enc.Encode(true))
 	require.NoError(t, enc.Encode([]interface{}{uint64(1700000000), map[string]interface{}{"Text": "b"}}))
 
 	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, unsafe.Pointer(&buf[0]), cInt(len(buf)), cTag("app")))

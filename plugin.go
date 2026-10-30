@@ -198,6 +198,23 @@ func flushChunk(ctx context.Context, tw *tableWriter, id int, binaryData [][]byt
 	}
 }
 
+// getRecord reads the next record from dec. It returns 0 and the record, -1 at the end of the
+// data (or when the next object cannot be decoded) and another negative value for a decoded
+// object that is not a [timestamp, map] record.
+//
+// output.GetRecord calls reflect.Value.Len before checking the kind of the decoded value, so
+// a top-level nil, number or bool panics inside it. By then the object has been consumed, so
+// the panic is turned into "malformed record" and the following objects can still be read.
+func getRecord(dec *output.FLBDecoder) (ret int, record map[interface{}]interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			ret, record = -2, nil
+		}
+	}()
+	ret, _, record = output.GetRecord(dec)
+	return ret, record
+}
+
 // decodeAndSerializeRecords decodes Fluent Bit records from dec, serializes each
 // to proto binary, and accumulates them in binaryData. When the accumulated size
 // reaches maxChunkSize, it calls flushChunk and resets binaryData
@@ -206,15 +223,15 @@ func flushChunk(ctx context.Context, tw *tableWriter, id int, binaryData [][]byt
 //
 // Records that cannot be used are skipped individually and never influence the return code:
 // malformed records (not a [timestamp, map] pair), records that cannot be serialized against
-// the table schema, and rows whose serialized size alone reaches chunkSizeLimit (such a row
-// could never fit into one AppendRows call, so sending it would fail the whole chunk with
-// INVALID_ARGUMENT).
+// the table schema, and rows whose serialized size alone reaches appendRequestLimit (such a
+// row cannot fit into any AppendRows request, so sending it would fail the whole chunk with
+// INVALID_ARGUMENT). A row larger than maxChunkSize but below that limit is sent on its own.
 func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, maxChunkSize int, dec *output.FLBDecoder, binaryData [][]byte, outcome *flushOutcome) [][]byte {
 	var currsize int
 	var malformed int
 
 	for {
-		ret, _, record := output.GetRecord(dec)
+		ret, record := getRecord(dec)
 		if ret == -1 {
 			// End of data, or a msgpack object the decoder could not decode (it cannot resync
 			// past it, so the rest of the chunk is unreadable either way).
@@ -232,8 +249,8 @@ func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, max
 			log.Printf("Transforming row with value:%v from map to binary data for output instance with id: %d failed in FLBPluginFlushCtx: %s", record, id, err)
 			continue
 		}
-		if len(buf) >= chunkSizeLimit {
-			log.Printf("Skipping row of %d bytes for output instance with id: %d in FLBPluginFlushCtx: a single row cannot exceed the %d byte AppendRows limit", len(buf), id, chunkSizeLimit)
+		if len(buf) >= appendRequestLimit {
+			log.Printf("Skipping row of %d bytes for output instance with id: %d in FLBPluginFlushCtx: a single AppendRows request must be less than %d bytes", len(buf), id, appendRequestLimit)
 			continue
 		}
 

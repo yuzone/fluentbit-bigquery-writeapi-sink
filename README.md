@@ -112,7 +112,7 @@ Keys are matched case-insensitively by Fluent Bit.
 | `Unknown_Table_Action` | string | `drop` | What to do with a chunk whose table cannot be resolved or initialised: `drop` logs and acknowledges the chunk (`FLB_OK`); `retry` returns `FLB_RETRY` so Fluent Bit redelivers it. A **transient** initialisation failure (backend unreachable, `Init_Timeout_Sec` exceeded) is not an unknown table: it is retried like a transient append failure regardless of this setting. A tag that cannot be mapped to a table at all (`$TAG[n]` out of range, invalid dataset/table ID) is always dropped, because redelivering the same tag could never succeed. |
 | `Exactly_Once` | bool | `false` | `true` uses a committed stream with synchronous response checking (exactly-once). `false` uses the default stream with asynchronous response checking (at-least-once). |
 | `Num_Synchronous_Retries` | int | `4` | Maximum synchronous retries per append when `Exactly_Once` is `true`. Ignored otherwise. |
-| `Max_Chunk_Size` | int (bytes) | `9437184` (9 MiB) | Upper bound on the serialized size of a single `AppendRows` request. Values above 9 MiB are clamped to 9 MiB. A single row larger than this bound is still sent on its own; a row whose serialized size alone reaches 9 MiB can never be sent and is logged and skipped (see [Delivery semantics](#delivery-semantics)). |
+| `Max_Chunk_Size` | int (bytes) | `9437184` (9 MiB) | Upper bound on the serialized size of a single `AppendRows` request. Values above 9 MiB are clamped to 9 MiB, keeping every request below the 10 MB `AppendRows` limit. A single row larger than this bound is still sent on its own; a row whose serialized size alone reaches 10 MB can never be sent and is logged and skipped (see [Delivery semantics](#delivery-semantics)). |
 | `Max_Queue_Requests` | int | `1000` | Maximum number of in-flight (unacknowledged) `AppendRows` requests per stream. When the queue reaches 80 % of this value a new default stream is created (up to 10 streams per output instance). `0` or a negative value disables the limit. |
 | `Max_Queue_Bytes` | int (bytes) | `104857600` (100 MiB) | Maximum number of in-flight bytes per stream. `0` or a negative value disables the limit. |
 | `DateTime_String_Type` | bool | `true` | `true` accepts `DATETIME` values as strings. `false` accepts civil-time encoded `int64`. Applies to nested `DATETIME` fields as well; `RANGE<DATETIME>` always expects `int64`. |
@@ -264,11 +264,14 @@ remaining requests.
 Records that cannot be converted to the table schema on the client side are
 logged and skipped individually; retrying would not help, so they never
 influence the return code. The same applies to a single row whose serialized
-size alone reaches the 9 MiB `AppendRows` bound (it could never be sent, and
-sending it would fail the whole chunk with `INVALID_ARGUMENT`), and to
-malformed records in the chunk (msgpack objects that are not a
-`[timestamp, map]` pair): they are counted, logged once per flush and skipped,
-while the records after them are still delivered.
+size alone reaches the 10 MB `AppendRows` request limit (it could never be
+sent, and sending it would fail the whole chunk with `INVALID_ARGUMENT`), and
+to malformed records in the chunk (msgpack objects that are not a
+`[timestamp, map]` pair, including bare scalars): they are counted, logged once
+per flush and skipped, while the records after them are still delivered. A row
+larger than `Max_Chunk_Size` but below the request limit is sent in a request
+of its own; the request overhead is not accounted for, so a row very close to
+the limit can still be rejected by the backend.
 
 ## Shutdown
 

@@ -29,7 +29,8 @@ import (
 )
 
 const (
-	chunkSizeLimit             = 9 * 1024 * 1024   // BigQuery Storage Write API AppendRows hard limit (10MB minus overhead)
+	chunkSizeLimit             = 9 * 1024 * 1024   // upper bound for Max_Chunk_Size: keeps a request well below appendRequestLimit
+	appendRequestLimit         = 10 * 1000 * 1000  // BigQuery Storage Write API: a single AppendRows request must be less than 10 MB
 	queueRequestDefault        = 1000              // default Max_Queue_Requests (max in-flight AppendRows per stream)
 	queueByteDefault           = 100 * 1024 * 1024 // default Max_Queue_Bytes: 100 MB
 	exactlyOnceDefault         = false
