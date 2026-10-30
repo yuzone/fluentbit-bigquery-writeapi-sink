@@ -512,8 +512,32 @@ func TestFLBPluginFlushCtxUnknownInstance(t *testing.T) {
 	assert.Equal(t, output.FLB_ERROR, FLBPluginExitCtx(nil))
 }
 
+// streamCount returns the number of streams of tw under streamMu.
+func streamCount(tw *tableWriter) int {
+	tw.streamMu.Lock()
+	defer tw.streamMu.Unlock()
+	return len(tw.streams)
+}
+
+// isScaling reports whether tw is creating an additional stream in the background.
+func isScaling(tw *tableWriter) bool {
+	tw.streamMu.Lock()
+	defer tw.streamMu.Unlock()
+	return tw.scaling
+}
+
+// blockNewStreams makes NewManagedStream block until the returned channel is closed.
+func blockNewStreams(c *fakeClient) chan struct{} {
+	block := make(chan struct{})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.blockNew = block
+	return block
+}
+
 // TestFLBPluginFlushCtxDynamicScaling verifies that a new stream is added whenever the least
-// loaded stream has more pending responses than the request-count threshold.
+// loaded stream has more pending responses than the request-count threshold. The stream is
+// created in the background; the test gates its completion to keep the sequence deterministic.
 func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 	d := installTestDeps(t, defaultInitKeys(nil))
 	plugin, id := initPlugin(t)
@@ -524,15 +548,29 @@ func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
 	d.client.mu.Lock()
 	d.client.stream = &fakeStream{pending: true}
 	d.client.mu.Unlock()
+	tw := configMap[id].router.static
+	block := blockNewStreams(d.client)
 
 	data, n := fiveRecords(t)
-	for i := 0; i < 3; i++ {
-		assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
-	}
-	// Init creates the first stream; the 2nd and 3rd flush each observe one pending response
-	// on the least loaded stream and add another one.
-	assert.Equal(t, 3, d.client.newStreamCalls())
-	assert.Len(t, configMap[id].router.static.streams, 3)
+	// The first flush finds an empty queue; the second observes one pending response on the
+	// only stream and starts creating another one.
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.Equal(t, 1, streamCount(tw))
+	assert.True(t, isScaling(tw))
+	close(block)
+	require.Eventually(t, func() bool { return streamCount(tw) == 2 }, time.Second, time.Millisecond)
+
+	// The next flush lands on the new (empty) stream; the one after observes its pending
+	// response and adds a third stream.
+	block = blockNewStreams(d.client)
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.False(t, isScaling(tw))
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(plugin, data, n, cTag("app")))
+	assert.True(t, isScaling(tw))
+	close(block)
+	require.Eventually(t, func() bool { return streamCount(tw) == 3 }, time.Second, time.Millisecond)
+	assert.Equal(t, 3, d.client.newStreamCalls(), "init creates the first stream, scaling the other two")
 }
 
 func TestFLBPluginFlushCtxDynamicScalingCap(t *testing.T) {
@@ -543,12 +581,105 @@ func TestFLBPluginFlushCtxDynamicScalingCap(t *testing.T) {
 	d.client.stream = &fakeStream{pending: true}
 	d.client.mu.Unlock()
 	d.client.streams[0].pending = true
+	tw := configMap[id].router.static
 
 	data, n := fiveRecords(t)
-	for i := 0; i < maxNumStreamsPerInstance+3; i++ {
+	require.Eventually(t, func() bool {
+		FLBPluginFlushCtx(plugin, data, n, cTag("app"))
+		return streamCount(tw) == maxNumStreamsPerInstance
+	}, 5*time.Second, time.Millisecond)
+	for i := 0; i < 3; i++ {
 		FLBPluginFlushCtx(plugin, data, n, cTag("app"))
 	}
-	assert.Len(t, configMap[id].router.static.streams, maxNumStreamsPerInstance)
+	assert.False(t, isScaling(tw))
+	assert.Equal(t, maxNumStreamsPerInstance, streamCount(tw))
+	assert.Equal(t, maxNumStreamsPerInstance, d.client.newStreamCalls())
+}
+
+// Stream creation can take up to Init_Timeout_Sec while the backend is degraded. It must run
+// in the background: neither the flush that triggers the scaling nor concurrent flushes of the
+// same table may wait for it, and only one additional stream is created at a time.
+func TestFLBPluginFlushCtxDynamicScalingDoesNotBlockFlushes(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.requestCountThreshold = 0
+		c.flushTimeout = 500 * time.Millisecond
+		c.initTimeout = 10 * time.Second
+	})
+	f.stream.pending = true
+	require.NoError(t, f.router.init())
+	block := blockNewStreams(f.client)
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "hello"})
+	tw := f.router.static
+
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	}
+	assert.Less(t, time.Since(start), f.cfg.flushTimeout, "flushes do not wait for the stream being created")
+	assert.Equal(t, int32(4), f.appendCalls(), "every flush is appended to the existing stream meanwhile")
+	assert.True(t, isScaling(tw))
+	assert.Equal(t, 1, streamCount(tw))
+
+	close(block)
+	require.Eventually(t, func() bool { return streamCount(tw) == 2 }, time.Second, time.Millisecond)
+	assert.False(t, isScaling(tw))
+	assert.Equal(t, 2, f.client.newStreamCalls(), "concurrent flushes do not start a second stream creation")
+}
+
+// A scaling attempt that fails (here: Init_Timeout_Sec exceeded) leaves the stream list as it
+// was and allows a later flush to try again.
+func TestFLBPluginFlushCtxDynamicScalingFailureRetriesLater(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.requestCountThreshold = 0
+		c.initTimeout = 200 * time.Millisecond
+	})
+	f.stream.pending = true
+	require.NoError(t, f.router.init())
+	block := blockNewStreams(f.client)
+	ptr := registerTestConfig(t, f.cfg)
+	data, n := encodeRecords(t, map[string]interface{}{"Text": "hello"})
+	tw := f.router.static
+
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	require.True(t, isScaling(tw))
+	require.Eventually(t, func() bool { return !isScaling(tw) }, time.Second, time.Millisecond, "the attempt gives up after Init_Timeout_Sec")
+	assert.Equal(t, 1, streamCount(tw))
+
+	close(block)
+	require.Eventually(t, func() bool { return f.stream.closes.Load() == 1 }, time.Second, time.Millisecond,
+		"a stream created after the deadline is closed")
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	require.Eventually(t, func() bool { return streamCount(tw) == 2 }, time.Second, time.Millisecond, "the next flush scales again")
+}
+
+// A stream whose creation completes after the writer was closed is closed rather than added.
+func TestTableWriterCloseDuringScaling(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+		c.requestCountThreshold = 0
+		c.initTimeout = 10 * time.Second
+	})
+	f.stream.pending = true
+	require.NoError(t, f.router.init())
+	block := blockNewStreams(f.client)
+	tw := f.router.static
+
+	require.NoError(t, tw.flush(context.Background(), [][]byte{{}}))
+	tw.maybeScale()
+	require.True(t, isScaling(tw))
+
+	assert.False(t, tw.close(context.Background()))
+	assert.Equal(t, int32(1), f.stream.closes.Load())
+
+	close(block)
+	require.Eventually(t, func() bool { return f.stream.closes.Load() == 2 }, time.Second, time.Millisecond,
+		"the late stream is closed instead of being added")
+	assert.Equal(t, 1, streamCount(tw))
+	assert.False(t, isScaling(tw))
+	tw.maybeScale()
+	assert.False(t, isScaling(tw), "a closed writer does not scale")
 }
 
 // TestFLBPluginFlushCtxExactlyOnce verifies the committed-stream path: responses are checked

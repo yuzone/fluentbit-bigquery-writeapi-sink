@@ -270,8 +270,9 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	defer flushCancel()
 
 	// Drain ready responses of earlier (already acknowledged) chunks and check whether a new
-	// stream should be created. Failures found here are logged by drainResponses but cannot
-	// change this chunk's return code: the chunks they belong to were acknowledged already.
+	// stream should be created (the stream itself is built in the background, see maybeScale).
+	// Failures found here are logged by drainResponses but cannot change this chunk's return
+	// code: the chunks they belong to were acknowledged already.
 	tw.drainResponses(flushCtx, false)
 	tw.maybeScale()
 
