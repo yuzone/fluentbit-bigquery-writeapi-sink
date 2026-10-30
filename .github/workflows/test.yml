@@ -23,7 +23,7 @@ jobs:
       run: go build -buildmode=c-shared -o out_writeapi.so
 
     - name: Run tests
-      run: go test -v -skip "^Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandlingExactlyOnce|DefaultValue)$"
+      run: go test -v -race -skip "^Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandlingExactlyOnce|DefaultValue)$"
 
     - name: Run integration tests
       # Integration tests require GCP credentials

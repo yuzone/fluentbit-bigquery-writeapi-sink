@@ -7,10 +7,10 @@ toolchain go1.27.3
 require (
 	cloud.google.com/go v0.123.0
 	cloud.google.com/go/bigquery v1.74.0
-	github.com/agiledragon/gomonkey/v2 v2.14.0
 	github.com/fluent/fluent-bit-go v0.0.0-20260305090907-bda21e692da6
 	github.com/googleapis/gax-go/v2 v2.20.0
 	github.com/stretchr/testify v1.11.1
+	github.com/ugorji/go/codec v1.3.1
 	google.golang.org/api v0.273.0
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
@@ -37,7 +37,6 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/ugorji/go/codec v1.3.1 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect

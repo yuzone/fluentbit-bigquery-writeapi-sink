@@ -1,2 +1,5 @@
 # Build artifacts (go build -buildmode=c-shared)
 out_writeapi.so
+
+# e2e harness artifacts
+hack/e2e/build/
