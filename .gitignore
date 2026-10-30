@@ -1,0 +1,2 @@
+# Build artifacts (go build -buildmode=c-shared)
+out_writeapi.so

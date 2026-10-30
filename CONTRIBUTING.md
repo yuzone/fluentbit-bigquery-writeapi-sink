@@ -1,32 +1,41 @@
-# How to Contribute
+# Contributing
 
-We would love to accept your patches and contributions to this project.
+Thanks for your interest in improving this plugin. Bug reports, feature
+requests and pull requests are welcome.
 
-## Before you begin
+## Reporting issues
 
-### Sign our Contributor License Agreement
+Open an issue at
+<https://github.com/yuzone/fluentbit-bigquery-writeapi-sink/issues>. Please
+include the plugin version (release tag or commit), the Fluent Bit version, the
+relevant `[OUTPUT]` configuration (with project/dataset/table redacted as
+needed) and any log output.
 
-Contributions to this project must be accompanied by a
-[Contributor License Agreement](https://cla.developers.google.com/about) (CLA).
-You (or your employer) retain the copyright to your contribution; this simply
-gives us permission to use and redistribute your contributions as part of the
-project.
+Issues and pull requests are written in English. Japanese notes may be added
+inside `<details>` blocks.
 
-If you or your current employer have already signed the Google CLA (even if it
-was for a different project), you probably don't need to do it again.
+## Pull requests
 
-Visit <https://cla.developers.google.com/> to see your current agreements or to
-sign a new one.
+1. Fork the repository and create a topic branch from `main`.
+2. Make your change. Keep unrelated changes out of the same pull request.
+3. Make sure the following pass locally (CGO is required):
 
-### Review our Community Guidelines
+   ```sh
+   go vet ./...
+   go build -buildmode=c-shared -o out_writeapi.so
+   go test -skip "^Test(Pipeline|ExactlyOnce|ErrorHandlingDefault|ErrorHandlingExactlyOnce|DefaultValue)$" ./...
+   ```
 
-This project follows [Google's Open Source Community
-Guidelines](https://opensource.google/conduct/).
+   The skipped tests are integration tests that need a real BigQuery table;
+   see `integration_test.go` for the environment variables they read.
+4. Open a pull request against `main`. All changes, including those from
+   maintainers, go through pull request review.
 
-## Contribution process
+Every push to `main` publishes a pre-release and every `v*` tag publishes a
+release via `.github/workflows/release.yml`.
 
-### Code Reviews
+## License
 
-All submissions, including submissions by project members, require review. We
-use [GitHub pull requests](https://docs.github.com/articles/about-pull-requests)
-for this purpose.
+By contributing you agree that your contributions will be licensed under the
+[Apache License 2.0](LICENSE) that covers this project. Keep the existing
+license headers in source files.

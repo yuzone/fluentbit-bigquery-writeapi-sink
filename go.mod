@@ -1,4 +1,4 @@
-module fluent-bit_writeapi_plugin
+module github.com/yuzone/fluentbit-bigquery-writeapi-sink
 
 go 1.25.0
 
