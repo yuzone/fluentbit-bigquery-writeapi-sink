@@ -157,10 +157,10 @@ func TestFLBPluginFlushCtxExactlyOnceSynchronousRetriesFollowClassification(t *t
 	}
 }
 
-// A row whose serialized size alone reaches the 10 MB AppendRows request limit can never be
-// sent; it is logged and skipped like a row that cannot be serialized, and the rest of the
-// chunk is delivered normally. A row above Max_Chunk_Size but below that limit is still sent
-// on its own.
+// A row that does not fit into an AppendRows request of its own (10 MB including the request
+// overhead) can never be sent; it is logged and skipped like a row that cannot be serialized,
+// and the rest of the chunk is delivered normally. A row above Max_Chunk_Size that still fits
+// is sent on its own.
 func TestFLBPluginFlushCtxOversizedRowIsSkipped(t *testing.T) {
 	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.retryOnFailure = true })
 	require.NoError(t, f.router.init())
@@ -171,18 +171,25 @@ func TestFLBPluginFlushCtxOversizedRowIsSkipped(t *testing.T) {
 		return readyResult(-1, nil), nil
 	})
 	ptr := registerTestConfig(t, f.cfg)
-	large := strings.Repeat("x", chunkSizeLimit) // above Max_Chunk_Size, below the request limit
+	tw := f.router.static
+	require.Less(t, tw.maxRowBytes, appendRequestLimit, "the request overhead is accounted for")
+	require.Greater(t, tw.maxRowBytes, chunkSizeLimit)
+	// A STRING field serializes to tag (1 byte) + length varint (4 bytes for these sizes) + payload.
+	const fieldOverhead = 5
+	largest := strings.Repeat("x", tw.maxRowBytes-1-fieldOverhead) // the largest row that fits
+	tooLarge := strings.Repeat("z", tw.maxRowBytes-fieldOverhead)  // below the limit alone, above it with the overhead
 	data, n := encodeRecords(t,
 		map[string]interface{}{"Text": "a"},
 		map[string]interface{}{"Text": strings.Repeat("y", appendRequestLimit)},
-		map[string]interface{}{"Text": large},
+		map[string]interface{}{"Text": tooLarge},
+		map[string]interface{}{"Text": largest},
 		map[string]interface{}{"Text": "b"},
 	)
 
 	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
 	require.Len(t, requests, 3)
 	assert.Equal(t, []string{"a"}, f.textValues(t, requests[0]))
-	assert.Equal(t, []string{large}, f.textValues(t, requests[1]), "a row above Max_Chunk_Size is sent alone")
+	assert.Equal(t, []string{largest}, f.textValues(t, requests[1]), "a row above Max_Chunk_Size that fits is sent alone")
 	assert.Equal(t, []string{"b"}, f.textValues(t, requests[2]))
 }
 

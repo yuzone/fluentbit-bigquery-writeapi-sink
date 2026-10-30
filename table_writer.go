@@ -62,6 +62,9 @@ type tableWriter struct {
 	schemaDesc        *descriptorpb.DescriptorProto
 	timestampFields   []string
 	fieldCache        fieldLookupCache
+	// maxRowBytes is the largest serialized row that still fits into an AppendRows request of
+	// its own, see rowFits.
+	maxRowBytes int
 
 	streamMu sync.Mutex // guards streams and its elements (streamConfig), scaling and closed
 	streams  []*streamConfig
@@ -118,6 +121,7 @@ func newTableWriter(ctx context.Context, client ManagedWriterClient, project, da
 		fieldCache:        buildFieldLookupCache(md),
 		streams:           []*streamConfig{{}},
 	}
+	tw.maxRowBytes = appendRequestLimit - appendRequestOverhead(tableRef, descriptor)
 
 	if err := tw.buildStream(ctx, 0); err != nil {
 		return nil, fmt.Errorf("Creating a new managed stream with destination table: %s failed: %w", tableRef, err)
@@ -299,6 +303,26 @@ func convertTimestampValueRaw(data map[interface{}]interface{}, field string, va
 func (tw *tableWriter) serializeRecord(record map[interface{}]interface{}) ([]byte, error) {
 	convertTimestampFieldsRaw(record, tw.timestampFields)
 	return rawMapToBinary(tw.messageDescriptor, record, tw.fieldCache)
+}
+
+// appendRequestFixedOverhead bounds the parts of an AppendRows request that do not scale
+// with the table: the stream name suffix ("/streams/" plus a stream ID), the trace ID, the
+// offset, and the protobuf tags and length prefixes of the nested ProtoData / ProtoRows /
+// serialized_rows wrappers. The real values are well below 1 KiB.
+const appendRequestFixedOverhead = 1024
+
+// appendRequestOverhead estimates the bytes an AppendRows request carrying a single row adds
+// on top of the serialized row: the writer schema (sent by the managed writer on the first
+// request of every connection, so it has to fit together with any row), the stream name and
+// the fixed wrappers. The estimate errs on the large side.
+func appendRequestOverhead(tableRef string, schema *descriptorpb.DescriptorProto) int {
+	return proto.Size(schema) + len(tableRef) + appendRequestFixedOverhead
+}
+
+// rowFits reports whether a serialized row can be sent in an AppendRows request of its own
+// without exceeding appendRequestLimit. A row that does not fit can never be delivered.
+func (tw *tableWriter) rowFits(buf []byte) bool {
+	return len(buf) < tw.maxRowBytes
 }
 
 func isReady(result appendResult) bool {

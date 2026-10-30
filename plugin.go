@@ -223,9 +223,10 @@ func getRecord(dec *output.FLBDecoder) (ret int, record map[interface{}]interfac
 //
 // Records that cannot be used are skipped individually and never influence the return code:
 // malformed records (not a [timestamp, map] pair), records that cannot be serialized against
-// the table schema, and rows whose serialized size alone reaches appendRequestLimit (such a
-// row cannot fit into any AppendRows request, so sending it would fail the whole chunk with
-// INVALID_ARGUMENT). A row larger than maxChunkSize but below that limit is sent on its own.
+// the table schema, and rows that do not fit into an AppendRows request of their own
+// (tableWriter.rowFits: the request would exceed appendRequestLimit, so sending it would fail
+// the whole chunk with INVALID_ARGUMENT). A row larger than maxChunkSize that still fits is
+// sent on its own.
 func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, maxChunkSize int, dec *output.FLBDecoder, binaryData [][]byte, outcome *flushOutcome) [][]byte {
 	var currsize int
 	var malformed int
@@ -249,8 +250,8 @@ func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, max
 			log.Printf("Transforming row with value:%v from map to binary data for output instance with id: %d failed in FLBPluginFlushCtx: %s", record, id, err)
 			continue
 		}
-		if len(buf) >= appendRequestLimit {
-			log.Printf("Skipping row of %d bytes for output instance with id: %d in FLBPluginFlushCtx: a single AppendRows request must be less than %d bytes", len(buf), id, appendRequestLimit)
+		if !tw.rowFits(buf) {
+			log.Printf("Skipping row of %d bytes for output instance with id: %d in FLBPluginFlushCtx: with the request overhead for table %s it exceeds the %d byte AppendRows limit", len(buf), id, tw.tableRef, appendRequestLimit)
 			continue
 		}
 
