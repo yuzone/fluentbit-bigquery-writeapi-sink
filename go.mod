@@ -1,8 +1,8 @@
 module github.com/yuzone/fluentbit-bigquery-writeapi-sink
 
-go 1.25.0
+go 1.27.0
 
-toolchain go1.25.1
+toolchain go1.27.3
 
 require (
 	cloud.google.com/go v0.123.0
