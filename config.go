@@ -29,7 +29,8 @@ import (
 )
 
 const (
-	chunkSizeLimit             = 9 * 1024 * 1024   // BigQuery Storage Write API AppendRows hard limit (10MB minus overhead)
+	chunkSizeLimit             = 9 * 1024 * 1024   // upper bound for Max_Chunk_Size: keeps a request well below appendRequestLimit
+	appendRequestLimit         = 10 * 1000 * 1000  // BigQuery Storage Write API: a single AppendRows request must be less than 10 MB
 	queueRequestDefault        = 1000              // default Max_Queue_Requests (max in-flight AppendRows per stream)
 	queueByteDefault           = 100 * 1024 * 1024 // default Max_Queue_Bytes: 100 MB
 	exactlyOnceDefault         = false
@@ -175,6 +176,8 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 		cfg.maxChunkSize = chunkSizeLimit
 	}
 
+	// Max_Queue_Requests / Max_Queue_Bytes <= 0 disable the respective in-flight limit in the
+	// managed writer (its flow controller only creates a semaphore for positive values).
 	if cfg.maxQueueRequests, err = getConfigField(flb, plugin, "Max_Queue_Requests", queueRequestDefault); err != nil {
 		return nil, fmt.Errorf("Invalid Max_Queue_Requests parameter in configuration file: %w", err)
 	}
@@ -185,12 +188,15 @@ func parseOutputConfig(plugin unsafe.Pointer, flb flbBridge) (*outputConfig, err
 	}
 
 	if cfg.dateTimeStringType, err = getConfigField(flb, plugin, "DateTime_String_Type", dateTimeDefault); err != nil {
-		return nil, fmt.Errorf("Invalid DateTime_Input_Type parameter in configuration file: %w", err)
+		return nil, fmt.Errorf("Invalid DateTime_String_Type parameter in configuration file: %w", err)
 	}
 
 	flushTimeoutSec, err := getConfigField(flb, plugin, "Flush_Timeout_Sec", flushTimeoutSecDefault)
 	if err != nil {
 		return nil, fmt.Errorf("Invalid Flush_Timeout_Sec parameter in configuration file: %w", err)
+	}
+	if flushTimeoutSec < 1 {
+		return nil, fmt.Errorf("Invalid Flush_Timeout_Sec parameter in configuration file: must be >= 1, got %d", flushTimeoutSec)
 	}
 	cfg.flushTimeout = time.Duration(flushTimeoutSec) * time.Second
 

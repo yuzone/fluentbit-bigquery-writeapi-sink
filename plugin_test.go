@@ -18,6 +18,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -68,6 +69,7 @@ func TestIsTransientError(t *testing.T) {
 		{"aborted", status.Error(codes.Aborted, "x"), true},
 		{"internal", status.Error(codes.Internal, "x"), true},
 		{"canceled", status.Error(codes.Canceled, "x"), true},
+		{"unauthenticated", status.Error(codes.Unauthenticated, "token refresh failed"), true},
 		{"context deadline", context.DeadlineExceeded, true},
 		{"wrapped context canceled", errors.Join(errors.New("append"), context.Canceled), true},
 		{"eof", io.EOF, true},
@@ -76,6 +78,7 @@ func TestIsTransientError(t *testing.T) {
 		{"invalid argument", status.Error(codes.InvalidArgument, "schema mismatch"), false},
 		{"permission denied", status.Error(codes.PermissionDenied, "x"), false},
 		{"not found", status.Error(codes.NotFound, "x"), false},
+		{"failed precondition", status.Error(codes.FailedPrecondition, "x"), false},
 		{"unknown code", status.Error(codes.Unknown, "x"), false},
 		{"plain error", errors.New("boom"), false},
 	}
@@ -116,6 +119,105 @@ func TestFLBPluginFlushCtxReturnCodes(t *testing.T) {
 			assert.Equal(t, int32(1), f.appendCalls())
 		})
 	}
+}
+
+// The synchronous retries of the committed-stream path use the same classification as the
+// return code: a transient failure is retried Num_Synchronous_Retries times and then reported
+// as FLB_RETRY, a permanent one is reported as FLB_ERROR without any retry.
+func TestFLBPluginFlushCtxExactlyOnceSynchronousRetriesFollowClassification(t *testing.T) {
+	tests := []struct {
+		name        string
+		resultErr   error
+		want        int
+		wantAppends int32
+	}{
+		{"resource exhausted is retried then FLB_RETRY", status.Error(codes.ResourceExhausted, "x"), output.FLB_RETRY, 3},
+		{"unauthenticated is retried then FLB_RETRY", status.Error(codes.Unauthenticated, "x"), output.FLB_RETRY, 3},
+		{"failed precondition is not retried and FLB_ERROR", status.Error(codes.FailedPrecondition, "x"), output.FLB_ERROR, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) {
+				c.retryOnFailure = true
+				c.exactlyOnce = true
+				c.streamType = managedwriter.CommittedStream
+				c.numRetries = 2
+			})
+			require.NoError(t, f.router.init())
+			f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+				return readyResult(0, tt.resultErr), nil
+			})
+			ptr := registerTestConfig(t, f.cfg)
+			data, n := encodeRecords(t, map[string]interface{}{"Text": "hello"})
+
+			assert.Equal(t, tt.want, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+			assert.Equal(t, tt.wantAppends, f.appendCalls())
+			assert.Len(t, f.clock.sleeps, int(tt.wantAppends-1), "one backoff between attempts")
+		})
+	}
+}
+
+// A row that does not fit into an AppendRows request of its own (10 MB including the request
+// overhead) can never be sent; it is logged and skipped like a row that cannot be serialized,
+// and the rest of the chunk is delivered normally. A row above Max_Chunk_Size that still fits
+// is sent on its own.
+func TestFLBPluginFlushCtxOversizedRowIsSkipped(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.retryOnFailure = true })
+	require.NoError(t, f.router.init())
+	var requests [][][]byte
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		// binaryData is reused between sub-chunks, so keep a copy of this request.
+		requests = append(requests, append([][]byte(nil), data...))
+		return readyResult(-1, nil), nil
+	})
+	ptr := registerTestConfig(t, f.cfg)
+	tw := f.router.static
+	require.Less(t, tw.maxRowBytes, appendRequestLimit, "the request overhead is accounted for")
+	require.Greater(t, tw.maxRowBytes, chunkSizeLimit)
+	// A STRING field serializes to tag (1 byte) + length varint (4 bytes for these sizes) + payload.
+	const fieldOverhead = 5
+	largest := strings.Repeat("x", tw.maxRowBytes-1-fieldOverhead) // the largest row that fits
+	tooLarge := strings.Repeat("z", tw.maxRowBytes-fieldOverhead)  // below the limit alone, above it with the overhead
+	data, n := encodeRecords(t,
+		map[string]interface{}{"Text": "a"},
+		map[string]interface{}{"Text": strings.Repeat("y", appendRequestLimit)},
+		map[string]interface{}{"Text": tooLarge},
+		map[string]interface{}{"Text": largest},
+		map[string]interface{}{"Text": "b"},
+	)
+
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, data, n, cTag("app")))
+	require.Len(t, requests, 3)
+	assert.Equal(t, []string{"a"}, f.textValues(t, requests[0]))
+	assert.Equal(t, []string{largest}, f.textValues(t, requests[1]), "a row above Max_Chunk_Size that fits is sent alone")
+	assert.Equal(t, []string{"b"}, f.textValues(t, requests[2]))
+}
+
+// A msgpack object that is not a [timestamp, map] record must not end the chunk: the decoder
+// has consumed it, so the records after it are still delivered. This includes top-level
+// values on which output.GetRecord panics (nil, numbers, bools).
+func TestFLBPluginFlushCtxMalformedRecordIsSkipped(t *testing.T) {
+	f := newRouterFixture(t, "ds", "tbl", func(c *outputConfig) { c.retryOnFailure = true })
+	require.NoError(t, f.router.init())
+	var appended [][]byte
+	f.onAppend(func(ctx context.Context, data [][]byte) (appendResult, error) {
+		appended = append(appended, data...)
+		return readyResult(-1, nil), nil
+	})
+	ptr := registerTestConfig(t, f.cfg)
+	var buf []byte
+	enc := codec.NewEncoderBytes(&buf, new(codec.MsgpackHandle))
+	require.NoError(t, enc.Encode([]interface{}{uint64(1700000000), map[string]interface{}{"Text": "a"}}))
+	require.NoError(t, enc.Encode([]interface{}{uint64(1700000000), map[string]interface{}{"Text": "x"}, "extra"}))
+	require.NoError(t, enc.Encode([]interface{}{uint64(1700000000), "not a map"}))
+	require.NoError(t, enc.Encode(nil))
+	require.NoError(t, enc.Encode(42))
+	require.NoError(t, enc.Encode(true))
+	require.NoError(t, enc.Encode([]interface{}{uint64(1700000000), map[string]interface{}{"Text": "b"}}))
+
+	assert.Equal(t, output.FLB_OK, FLBPluginFlushCtx(ptr, unsafe.Pointer(&buf[0]), cInt(len(buf)), cTag("app")))
+	assert.Equal(t, int32(1), f.appendCalls())
+	assert.Equal(t, []string{"a", "b"}, f.textValues(t, appended))
 }
 
 // A transient failure on an early sub-chunk must stop the flush: the whole chunk is redelivered
@@ -521,6 +623,10 @@ func TestFLBPluginInit(t *testing.T) {
 func TestFLBPluginInitFailures(t *testing.T) {
 	t.Run("invalid configuration", func(t *testing.T) {
 		installTestDeps(t, defaultInitKeys(map[string]string{"Max_Chunk_Size": "abc"}))
+		assert.Equal(t, output.FLB_ERROR, FLBPluginInit(unsafe.Pointer(new(int))))
+	})
+	t.Run("Flush_Timeout_Sec below 1", func(t *testing.T) {
+		installTestDeps(t, defaultInitKeys(map[string]string{"Flush_Timeout_Sec": "0"}))
 		assert.Equal(t, output.FLB_ERROR, FLBPluginInit(unsafe.Pointer(new(int))))
 	})
 	t.Run("client creation fails", func(t *testing.T) {
