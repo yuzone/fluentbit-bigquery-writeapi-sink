@@ -95,6 +95,8 @@ type routerFixture struct {
 	router         *tableRouter
 	getWriteStream map[string]*atomic.Int32 // table ref -> call count
 	failTables     map[string]error         // table ref -> error returned by GetWriteStream
+	appendRows     func(ctx context.Context, data [][]byte) (*managedwriter.AppendResult, error)
+	appendCalls    atomic.Int32
 	closedStreams  atomic.Int32
 	mu             sync.Mutex
 	restore        func()
@@ -128,6 +130,10 @@ func newRouterFixture(t *testing.T, dataset, table string, mutate func(*outputCo
 	}
 	mockStream := &MockManagedStream{
 		AppendRowsFunc: func(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error) {
+			f.appendCalls.Add(1)
+			if f.appendRows != nil {
+				return f.appendRows(ctx, data)
+			}
 			return nil, nil
 		},
 		CloseFunc:      func() error { f.closedStreams.Add(1); return nil },

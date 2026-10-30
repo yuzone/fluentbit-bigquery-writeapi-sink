@@ -31,8 +31,12 @@ var (
 	configID  atomic.Int64
 )
 
-// cChar aliases C.char so that _test.go files (which cannot import "C") can build a tag pointer.
-type cChar = C.char
+// cChar and cInt alias C types so that _test.go files (which cannot import "C") can call the
+// exported entry points.
+type (
+	cChar = C.char
+	cInt  = C.int
+)
 
 // ManagedWriterClient wraps *managedwriter.Client so that tests can inject a mock.
 type ManagedWriterClient interface {
@@ -176,18 +180,59 @@ func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
 	return output.FLB_OK
 }
 
-// flushChunk sends binaryData through the table writer and logs failures.
-func flushChunk(ctx context.Context, tw *tableWriter, id int, binaryData [][]byte) {
+// flushOutcome accumulates the append failures of one FLBPluginFlushCtx call and maps
+// them to the plugin return code.
+type flushOutcome struct {
+	transientErr error
+	permanentErr error
+}
+
+func (o *flushOutcome) record(err error) {
+	if isTransientError(err) {
+		if o.transientErr == nil {
+			o.transientErr = err
+		}
+	} else if o.permanentErr == nil {
+		o.permanentErr = err
+	}
+}
+
+// abort reports whether the rest of the chunk should be skipped: once a transient failure
+// happened the whole chunk is going to be redelivered, so sending more sub-chunks would only
+// add duplicates.
+func (o *flushOutcome) abort() bool {
+	return o.transientErr != nil
+}
+
+// code maps the outcome to FLB_OK / FLB_RETRY / FLB_ERROR. With retryOnFailure disabled
+// failures are only logged and the chunk is acknowledged, as the plugin did historically.
+func (o *flushOutcome) code(retryOnFailure bool) int {
+	if !retryOnFailure {
+		return output.FLB_OK
+	}
+	switch {
+	case o.transientErr != nil:
+		return output.FLB_RETRY
+	case o.permanentErr != nil:
+		return output.FLB_ERROR
+	}
+	return output.FLB_OK
+}
+
+// flushChunk sends binaryData through the table writer, logs failures and records them in outcome.
+func flushChunk(ctx context.Context, tw *tableWriter, id int, binaryData [][]byte, outcome *flushOutcome) {
 	if err := tw.flush(ctx, binaryData); err != nil {
 		log.Printf("Appending data for output instance with id: %d to table %s failed in FLBPluginFlushCtx: %s", id, tw.tableRef, err)
+		outcome.record(err)
 	}
 }
 
 // decodeAndSerializeRecords decodes Fluent Bit records from dec, serializes each
 // to proto binary, and accumulates them in binaryData. When the accumulated size
 // reaches maxChunkSize, it calls flushChunk and resets binaryData
-// (preserving capacity for reuse). It returns the remaining (unsent) binaryData.
-func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, maxChunkSize int, dec *output.FLBDecoder, binaryData [][]byte) [][]byte {
+// (preserving capacity for reuse). It returns the remaining (unsent) binaryData,
+// or nil when a transient failure aborted the chunk.
+func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, maxChunkSize int, dec *output.FLBDecoder, binaryData [][]byte, outcome *flushOutcome) [][]byte {
 	var currsize int
 
 	for {
@@ -203,7 +248,10 @@ func decodeAndSerializeRecords(ctx context.Context, tw *tableWriter, id int, max
 		}
 
 		if (currsize + len(buf)) >= maxChunkSize {
-			flushChunk(ctx, tw, id, binaryData)
+			flushChunk(ctx, tw, id, binaryData, outcome)
+			if outcome.abort() {
+				return nil
+			}
 			// Nil out sent elements so GC can reclaim them, then reset slice.
 			for i := range binaryData {
 				binaryData[i] = nil
@@ -242,21 +290,26 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), config.flushTimeout)
 	defer flushCancel()
 
-	// Drain ready responses and check whether a new stream should be created.
+	// Drain ready responses of earlier (already acknowledged) chunks and check whether a new
+	// stream should be created. Failures found here are logged by drainResponses but cannot
+	// change this chunk's return code: the chunks they belong to were acknowledged already.
 	tw.drainResponses(flushCtx, false)
 	tw.maybeScale()
 
 	// binaryData is a flush-local buffer. Each worker (workers > 1) gets its own
 	// stack frame, so there is no shared state and no mutex needed here.
 	binaryData := make([][]byte, 0, 64)
+	var outcome flushOutcome
 
 	// Decode and serialize all records; mid-size chunks are sent inside the helper.
-	binaryData = decodeAndSerializeRecords(flushCtx, tw, id, config.maxChunkSize, newDecoder(data, int(length)), binaryData)
+	binaryData = decodeAndSerializeRecords(flushCtx, tw, id, config.maxChunkSize, newDecoder(data, int(length)), binaryData, &outcome)
 
-	// Send the final (possibly partial) chunk.
-	flushChunk(flushCtx, tw, id, binaryData)
+	// Send the final (possibly partial) chunk unless a transient failure already aborted the chunk.
+	if !outcome.abort() {
+		flushChunk(flushCtx, tw, id, binaryData, &outcome)
+	}
 
-	return output.FLB_OK
+	return outcome.code(config.retryOnFailure)
 }
 
 //export FLBPluginExit

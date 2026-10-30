@@ -39,6 +39,7 @@ const (
 	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC; values above this are treated as already in microseconds
 	flushTimeoutSecDefault     = 10         // default Flush_Timeout_Sec: 10 seconds per flush call
 	tagDelimitersDefault       = "."        // default Tag_Delimiters used to split the tag for $TAG[n]
+	retryOnFailureDefault      = true       // default Retry_On_Failure: return FLB_RETRY for transient append failures
 )
 
 // unknownTableAction is what FLBPluginFlushCtx does when the table resolved from the tag
@@ -80,6 +81,7 @@ type outputConfig struct {
 	requestCountThreshold int
 	dateTimeStringType    bool
 	flushTimeout          time.Duration
+	retryOnFailure        bool
 
 	client ManagedWriterClient
 	router *tableRouter
@@ -180,6 +182,10 @@ func parseOutputConfig(plugin unsafe.Pointer) (*outputConfig, error) {
 		return nil, fmt.Errorf("Invalid Flush_Timeout_Sec parameter in configuration file: %w", err)
 	}
 	cfg.flushTimeout = time.Duration(flushTimeoutSec) * time.Second
+
+	if cfg.retryOnFailure, err = getConfigField(plugin, "Retry_On_Failure", retryOnFailureDefault); err != nil {
+		return nil, fmt.Errorf("Invalid Retry_On_Failure parameter in configuration file: %w", err)
+	}
 
 	// Set the stream type based on exactly once parameter
 	if cfg.exactlyOnce {

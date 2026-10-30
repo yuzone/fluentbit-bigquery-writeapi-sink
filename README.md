@@ -117,6 +117,7 @@ Keys are matched case-insensitively by Fluent Bit.
 | `Max_Queue_Bytes` | int (bytes) | `104857600` (100 MiB) | Maximum number of in-flight bytes per stream. |
 | `DateTime_String_Type` | bool | `true` | `true` accepts `DATETIME` values as strings. `false` accepts civil-time encoded `int64`. Applies to nested `DATETIME` fields as well; `RANGE<DATETIME>` always expects `int64`. |
 | `Flush_Timeout_Sec` | int (seconds) | `10` | Deadline for a single flush call (and for draining pending responses on exit). |
+| `Retry_On_Failure` | bool | `true` | `true` returns `FLB_RETRY` / `FLB_ERROR` to Fluent Bit when an append fails (see [Delivery semantics](#delivery-semantics)). `false` restores the historical behaviour of logging the failure and acknowledging the chunk. |
 
 Boolean values are parsed with Go's `strconv.ParseBool` (`true`/`false`,
 `1`/`0`, `t`/`f`, …). An unparsable value fails plugin initialisation.
@@ -188,13 +189,42 @@ Behaviour:
 details: [Storage Write API data type
 conversions](https://cloud.google.com/bigquery/docs/write-api#data_type_conversions).
 
-## Error handling
+## Delivery semantics
 
-- **Client-side errors** (a record that cannot be converted to the table
-  schema) are logged and the record is skipped; the rest of the batch is sent.
-- **Server-side errors** (returned by BigQuery) are logged. If any row in a
-  request is rejected the whole request fails, matching BigQuery behaviour, and
-  the plugin continues with the next flush.
+Each call of the output (one Fluent Bit chunk, one tag) ends with one of the
+Fluent Bit return codes:
+
+| Code | When | Fluent Bit reaction |
+|---|---|---|
+| `FLB_OK` | Every `AppendRows` call of the chunk was accepted (or handed to the default stream). Also returned when `Retry_On_Failure` is `false`, and for unknown tables with `Unknown_Table_Action drop`. | Chunk is acknowledged and released. |
+| `FLB_RETRY` | A **transient** failure: gRPC `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, `ABORTED`, `INTERNAL`, `CANCELLED`, connection errors, `io.EOF`, context deadline/cancellation. Also returned for unknown tables with `Unknown_Table_Action retry`. | Chunk is kept in the buffer and redelivered according to `Retry_Limit` / `scheduler.*`. |
+| `FLB_ERROR` | A **permanent** failure: `INVALID_ARGUMENT` (for example schema mismatch), `PERMISSION_DENIED`, `NOT_FOUND`, and any other error. | Chunk is dropped and counted in the output's error metrics. |
+
+Which failures are visible at flush time depends on the mode:
+
+- **Default stream (`Exactly_Once false`, at-least-once)**: only the
+  synchronous error returned by `AppendRows` itself (connection problems,
+  request too large, stream closed, ...) can change the return code. The
+  server's answer arrives asynchronously and is checked on a later flush or at
+  exit; by then the chunk has already been acknowledged, so those errors are
+  **logged only** (`Encountered error ... while verifying the server
+  response`). The managed writer retries transient failures internally for
+  this path.
+- **Committed stream (`Exactly_Once true`)**: every append is confirmed
+  synchronously and retried up to `Num_Synchronous_Retries` times for
+  transient errors before the chunk is reported as `FLB_RETRY`.
+
+A chunk larger than `Max_Chunk_Size` is sent as several `AppendRows` requests.
+When a transient failure occurs the plugin stops sending the remaining
+requests, because Fluent Bit redelivers the **whole** chunk; the requests that
+were already accepted are therefore written twice. This is the usual
+at-least-once trade-off and also applies to committed streams (the retried
+chunk is appended at the next offset). Permanent failures do not stop the
+remaining requests.
+
+Records that cannot be converted to the table schema on the client side are
+logged and skipped individually; retrying would not help, so they never
+influence the return code.
 
 ## Backpressure and buffering
 

@@ -15,9 +15,11 @@ package main
 
 // These functions are based on: https://github.com/googleapis/google-cloud-go/blob/6a9c12a395245d8500c267437c2dfa897049a719/bigquery/storage/managedwriter/retry.go
 import (
+	"context"
 	"errors"
 	"io"
 	"math/rand"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,37 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// isTransientError classifies an AppendRows / GetResult failure for FLBPluginFlushCtx.
+// Transient errors (connectivity, deadlines, server-side throttling or hiccups) are worth
+// asking Fluent Bit to redeliver the chunk; everything else (INVALID_ARGUMENT,
+// PERMISSION_DENIED, NOT_FOUND, schema/row errors, ...) is permanent and retrying would
+// not help.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	if s, ok := status.FromError(err); ok {
+		switch s.Code() {
+		case codes.Unavailable,
+			codes.DeadlineExceeded,
+			codes.ResourceExhausted,
+			codes.Aborted,
+			codes.Internal,
+			codes.Canceled:
+			return true
+		}
+	}
+	return false
+}
 
 // This retry predicate is used for higher level retries, enqueing appends onto to a bidi
 // Channel and evaluating whether an append should be retried (re-enqueued).
